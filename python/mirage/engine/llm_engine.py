@@ -33,8 +33,21 @@ class _StreamingMonitor:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def register(self, rid: int, prompt_len: int, timeout: float) -> queue.Queue:
-        """Register a streaming session and return its token queue."""
+    def register(
+        self,
+        rid: int,
+        prompt_len: int,
+        timeout: float,
+        messages: Sequence[dict] | None = None,
+    ) -> queue.Queue:
+        """Register a streaming session and return its token queue.
+
+        *messages* is kept so the conversation can be remembered when the
+        request completes.  A streaming request has no other place to do it --
+        it returns a generator, so :meth:`LLMEngine.submit` is long gone by the
+        time the reply exists, and without this the continuation cache stays
+        empty for exactly the path a real server uses.
+        """
         q: queue.Queue = queue.Queue()
         with self._lock:
             self._sessions[rid] = {
@@ -43,6 +56,8 @@ class _StreamingMonitor:
                 'row': -1,
                 'last_step': prompt_len - 1,
                 'deadline': time.monotonic() + timeout,
+                'messages': messages,
+                'parts': [],
             }
         return q
 
@@ -65,6 +80,7 @@ class _StreamingMonitor:
                                 row, final_step = completion
                                 try:
                                     self._yield_remaining(s, row, final_step)
+                                    self._remember(s, row, final_step)
                                 finally:
                                     released = self._runtime.release_request(rid)
                                 if not released:
@@ -94,6 +110,7 @@ class _StreamingMonitor:
                                 for tid in new_tokens.tolist():
                                     text = self._tokenizer_manager.decode_single(tid)
                                     s['last_step'] += 1
+                                    s['parts'].append(text)
                                     s['q'].put((text, False))
 
                             # Check timeout.
@@ -115,6 +132,29 @@ class _StreamingMonitor:
 
             self._stop.wait(0.002)  # 2 ms polling interval
 
+    def _remember(self, s: dict, row: int, final_step: int) -> None:
+        """Hand this conversation's canonical ids to the tokenizer manager.
+
+        The reply is the concatenation of the chunks actually streamed, because
+        that is the assistant text the client will echo back next turn -- a
+        batch decode of the same ids can differ at a multi-byte boundary and
+        would key the entry under text no later request ever sends.
+
+        Called while the row is still leased, so the token buffer is readable.
+        A failure here costs a later cache hit, never correctness, and must not
+        take the monitor thread down.
+        """
+        messages = s.get('messages')
+        if messages is None or final_step <= 0:
+            return
+        try:
+            ids = self._runtime.read_tokens_range(
+                row, 0, final_step - 1).tolist()
+            self._tokenizer_manager.remember_continuation(
+                messages, "".join(s['parts']), ids, s['prompt_len'])
+        except Exception:
+            pass
+
     def _yield_remaining(self, s: dict, row: int, final_step: int) -> None:
         """Yield all remaining tokens for a completed request."""
         if final_step > s['last_step']:
@@ -124,6 +164,7 @@ class _StreamingMonitor:
             for j, tid in enumerate(new_ids):
                 text = self._tokenizer_manager.decode_single(tid)
                 is_final = (j == len(new_ids) - 1)
+                s['parts'].append(text)
                 s['q'].put((text, is_final))
                 s['last_step'] += 1
         else:
@@ -239,7 +280,7 @@ class LLMEngine:
             self._next_rid += 1
             if stream:
                 stream_queue = self._monitor.register(
-                    rid, prompt_len, timeout)
+                    rid, prompt_len, timeout, messages)
             try:
                 self.runtime.submit(rid, t)
             except Exception:
@@ -257,10 +298,17 @@ class LLMEngine:
                 full_tokens = self.runtime.read_tokens_at_row(
                     buffer_row, final_step)
                 output_ids = full_tokens[prompt_len:].tolist()
-                return {
-                    "text": self.tokenizer_manager.decode(output_ids),
-                    "token_ids": output_ids,
-                }
+                text = self.tokenizer_manager.decode(output_ids)
+                if messages is not None:
+                    # Remember the sequence the kernel actually ran on, so the
+                    # next turn of this conversation is built on it instead of
+                    # a fresh rendering.  ``[:final_step]`` is the range the KV
+                    # pages cover -- it drops the closing EOS, which the
+                    # template re-adds itself as the assistant turn's end.
+                    self.tokenizer_manager.remember_continuation(
+                        messages, text, full_tokens[:final_step].tolist(),
+                        prompt_len)
+                return {"text": text, "token_ids": output_ids}
             finally:
                 self.runtime.release_request(rid)
 

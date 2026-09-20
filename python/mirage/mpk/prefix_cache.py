@@ -208,23 +208,41 @@ class PrefixCache:
 
     def insert(
         self,
-        prompt_ids: Sequence[int],
+        token_ids: Sequence[int],
         page_ids: Sequence[int],
         final_kv_len: int,
         gen_tail_len: int,
         num_prefix_pages: int = 0,
+        prompt_len: Optional[int] = None,
     ) -> List[int]:
         """Account one completion: cache what is cacheable, free the rest.
 
         *page_ids* is the request's exported page table in page order, so page
-        ``j`` holds prompt tokens ``[j*PS, (j+1)*PS)``.  Pages below
+        ``j`` holds the tokens at ``[j*PS, (j+1)*PS)``.  Pages below
         *num_prefix_pages* were imported and are already cached (their pin drops
-        here, as in :meth:`on_export`); fresh pages fully inside the cacheable
-        range extend the chain, deduping against an identical block that another
-        request cached first.  Returns the pages to hand the return ring.
+        here); fresh pages fully inside the cacheable range extend the chain,
+        deduping against an identical block that another request cached first.
+        Returns the pages to hand the return ring.
+
+        *token_ids* is the sequence behind those pages.  Passing the whole
+        sequence -- prompt *and* generated tokens -- lets a later turn import
+        KV that has already been computed rather than re-prefilling it; passing
+        only the prompt keeps the v1 range.  *prompt_len* says where the prompt
+        ended, and defaults to the whole of *token_ids*.
+
+        The cacheable range stops at ``prompt_len - gen_tail_len`` whenever the
+        chat template has a per-turn tail.  That tail sits at the end of the
+        prompt, so once generated tokens are in the sequence it lands in the
+        *middle* of it -- and the next turn drops it, which breaks the chain
+        there.  Nothing past it could ever be a prefix of a later turn, so
+        caching it would only be dead weight.
         """
         page_size = self._page_size
-        cacheable = min(len(prompt_ids), final_kv_len) - gen_tail_len
+        if prompt_len is None:
+            prompt_len = len(token_ids)
+        cacheable = min(len(token_ids), final_kv_len)
+        if gen_tail_len:
+            cacheable = min(cacheable, prompt_len - gen_tail_len)
         full_pages = max(0, cacheable) // page_size
         free: List[int] = []
         parent: Optional[Block] = None
@@ -242,7 +260,7 @@ class PrefixCache:
                 self._unpin(block)
                 continue
             if chain_ok and num_prefix_pages <= idx < full_pages:
-                ids = tuple(prompt_ids[idx * page_size : (idx + 1) * page_size])
+                ids = tuple(token_ids[idx * page_size : (idx + 1) * page_size])
                 existing = self._find(parent, ids)
                 if existing is None:
                     parent = self._insert_block(parent, ids, page)

@@ -180,6 +180,21 @@ class OnlinePinnedRuntime:
         # Dedicated stream for HtoD / DtoH copies.
         self._write_stream = torch.cuda.Stream(device=mpk.tokens.device)
 
+        # Preallocated landing buffer for the owner thread's token readback.
+        # A `.clone()` would go through the caching allocator, and the first
+        # allocation of a given size calls cudaMalloc -- which can synchronise
+        # the default stream, where the never-exiting megakernel lives, and
+        # then never returns.  Allocated here, before the kernel launches, and
+        # copied into with `copy_`, this readback allocates nothing.
+        self._readback = torch.empty(
+            mpk.max_seq_length, dtype=mpk.tokens.dtype).pin_memory()
+        # A second one for :meth:`read_tokens_range` and its caller, which run
+        # on request and streaming threads rather than the owner thread.  Kept
+        # separate so those readbacks never contend with the owner tick.
+        self._pub_readback = torch.empty(
+            mpk.max_seq_length, dtype=mpk.tokens.dtype).pin_memory()
+        self._pub_readback_lock = threading.Lock()
+
         # Serialises one owner tick against another.  The owner thread is
         # normally the only ticker, but a driver running without one polls
         # through drain_completions(); this lock keeps the two strictly
@@ -462,7 +477,7 @@ class OnlinePinnedRuntime:
                 # ready clear, while the exported ids are still the GPU's
                 # published payload for this slot.
                 self._account_pages_locked(
-                    rid, final_step,
+                    rid, buffer_row, final_step,
                     self._check_exported_pages(slot, rid, final_step))
                 if rid in self._abandoned:
                     self._release_row_locked(rid, buffer_row)
@@ -477,15 +492,15 @@ class OnlinePinnedRuntime:
         return finished
 
     def _account_pages_locked(
-        self, rid: int, final_step: int, pages: List[int]
+        self, rid: int, buffer_row: int, final_step: int, pages: List[int]
     ) -> None:
         """Cache what this completion froze; return everything else.
 
         The exported pages are the request's whole page table, so page ``j``
-        holds prompt tokens ``[j*PS, (j+1)*PS)``.  Below ``npp`` they are the
+        holds the tokens at ``[j*PS, (j+1)*PS)``.  Below ``npp`` they are the
         pages the request imported -- their pin drops here; above it they are
-        fresh, and the ones entirely inside the cacheable prompt range extend
-        the chain.  The rest go to the return ring, as they always did.
+        fresh, and the ones entirely inside the cacheable range extend the
+        chain.  The rest go to the return ring, as they always did.
         """
         info = self._published.pop(rid, None)
         if self._cache is None or info is None or info.prompt_ids is None:
@@ -497,9 +512,48 @@ class OnlinePinnedRuntime:
         exported = set(pages)
         stranded = [b for b in info.blocks if b.page_id not in exported]
         self._return_pages_locked(self._cache.insert(
-            info.prompt_ids, pages, final_step, self._gen_tail_len,
-            num_prefix_pages=info.npp))
+            self._cacheable_ids(buffer_row, final_step, info),
+            pages, final_step, self._gen_tail_len,
+            num_prefix_pages=info.npp, prompt_len=len(info.prompt_ids)))
         self._cache.release(stranded)
+
+    def _cacheable_ids(
+        self, buffer_row: int, final_step: int, info: _Published
+    ) -> List[int]:
+        """The token ids behind this completion's KV pages.
+
+        The generated tokens' KV is already written into those pages, so
+        keying on the whole sequence lets a later turn import it instead of
+        re-prefilling it -- turn *k*'s answer is part of turn *k+1*'s prompt.
+        v1 keyed on the prompt ids kept at submit, which cost no readback but
+        stopped the cacheable range at the prompt and threw the generated
+        pages away.
+
+        Read back ``[0, final_step)``: that is exactly the KV length the
+        export was reconciled against.  The row is still leased here -- the
+        GPU holds it until the CPU acks through ``pinned_step`` -- so the token
+        buffer is stable for this read.
+
+        The copy lands in the preallocated pinned buffer rather than a fresh
+        tensor: on the owner thread this is the first read of the request's
+        lifetime, so a `.clone()` here hits the caching allocator cold and its
+        cudaMalloc can sit forever behind the persistent kernel (see
+        ``_readback``).  A failed read must not take the owner thread down --
+        the drain-error latch would fail every later request -- so it falls
+        back to the prompt-only range, which is always in memory.
+        """
+        if final_step <= 0:
+            return info.prompt_ids
+        try:
+            n = min(final_step, self._readback.shape[0])
+            with torch.cuda.stream(self._write_stream):
+                self._readback[:n].copy_(
+                    self._mpk.tokens[buffer_row, :n], non_blocking=True)
+            self._write_stream.synchronize()
+            return self._readback[:n].tolist()
+        except Exception:
+            self._page_stats["token_readback_failed"] += 1
+            return info.prompt_ids
 
     def _check_exported_pages(self, slot: int, rid: int, final_step: int) -> List[int]:
         """Reconcile one completion's exported KV page list.
@@ -677,17 +731,30 @@ class OnlinePinnedRuntime:
         buffer_row : row index into the token buffer
         final_step : number of tokens available (prompt + generated) - 1
         """
-        with torch.cuda.stream(self._write_stream):
-            result = self._mpk.tokens[buffer_row, : final_step + 1].clone()
-        self._write_stream.synchronize()
-        return result
+        return self.read_tokens_range(buffer_row, 0, final_step)
 
     def read_tokens_range(self, buffer_row: int, start: int, end: int) -> torch.Tensor:
-        """Read tokens [start..end] (inclusive) from *buffer_row*."""
-        with torch.cuda.stream(self._write_stream):
-            result = self._mpk.tokens[buffer_row, start : end + 1].clone()
-        self._write_stream.synchronize()
-        return result
+        """Read tokens [start..end] (inclusive) from *buffer_row*.
+
+        The copy lands in a preallocated pinned buffer and is handed back as a
+        host-side clone.  Cloning the device slice instead would allocate on the
+        CUDA caching allocator, and its first allocation of a given size calls
+        cudaMalloc -- which can synchronise the default stream, where the
+        persistent kernel never finishes, and then never returns.  Request and
+        streaming threads share the buffer, so the copy is serialised; it takes
+        microseconds and no other lock is held across it.
+        """
+        n = end - start + 1
+        if n <= 0:
+            return torch.empty(0, dtype=self._pub_readback.dtype)
+        n = min(n, self._pub_readback.shape[0])
+        with self._pub_readback_lock:
+            with torch.cuda.stream(self._write_stream):
+                self._pub_readback[:n].copy_(
+                    self._mpk.tokens[buffer_row, start : start + n],
+                    non_blocking=True)
+            self._write_stream.synchronize()
+            return self._pub_readback[:n].clone()
 
     def get_completion(self, rid: int) -> Tuple[int, int] | None:
         """Return the completion for *rid*, if the GPU has published it."""
