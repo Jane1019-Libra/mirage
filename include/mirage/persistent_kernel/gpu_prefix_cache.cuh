@@ -28,6 +28,9 @@
 //   and imports; Step 1 unpins, indexes and frees the rest of the page table
 //   itself; admission evicts on demand, leaf-first, by a CLOCK sweep over the
 //   table. The CPU cache and the page-return channel are idle in this mode.
+// Increment 6: warp-cooperative versions (pc_w_*) of match, insert and
+//   evict for the 31 idle lanes of the scheduler warp. Same table, same
+//   hash, same results as the serial versions; only the work is spread.
 //
 // Semantics are the CPU PrefixCache's (§6.4 v2.1-b), not an approximation of
 // them: a block is keyed by the chained hash h_j = H(h_{j-1}, ids_j), and a
@@ -83,6 +86,7 @@ constexpr int PC_CTL_GEN_TAIL = 1; // Python-written: prompt tail never cached
 constexpr int PC_CTL_TICK = 2;     // GPU-written: iterations since launch (lru)
 constexpr int PC_CTL_CLOCK = 3;    // GPU-written: CLOCK sweep cursor
 constexpr int PC_CTL_EVICT_STALL = 4; // GPU-written: a full sweep found nothing
+constexpr int PC_CTL_WARP = 5;        // Python-written: 1 = use the helper lanes
 constexpr int PC_MODE_SHADOW = 1;
 constexpr int PC_MODE_OWNER = 2;
 constexpr int PC_CTL_STATS = 8;
@@ -126,19 +130,38 @@ __device__ __forceinline__ void pc_add_ns(int *ctl, int idx,
   *acc += ns;
 }
 
-// 64-bit multiply-xorshift mix. Not cryptographic and does not need to be:
-// every hit is verified against the stored ids, so a collision costs a probe,
-// never a wrong page. Cheap enough for one scheduler lane to run per block.
+// Hashing. Not cryptographic and does not need to be: every hit is verified
+// against the stored ids, so a collision costs a probe, never a wrong page.
+// The block hash is an XOR of per-position mixes, so 31 lanes can each mix a
+// share of the ids and reduce, and the serial version computes the identical
+// value; the chain hash then mixes the parent in.
+__device__ __forceinline__ unsigned long long pc_mix64(unsigned long long x) {
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdull;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53ull;
+  x ^= x >> 33;
+  return x;
+}
+
+__device__ __forceinline__ unsigned long long pc_id_hash(long long id, int i) {
+  return pc_mix64(static_cast<unsigned long long>(id) * 0x9E3779B97F4A7C15ull +
+                  static_cast<unsigned long long>(i + 1) * 0xD6E8FEB86659FD93ull);
+}
+
+__device__ __forceinline__ unsigned long long
+    pc_chain_hash(unsigned long long parent, unsigned long long block_hash) {
+  return pc_mix64(parent ^ block_hash ^ 0x9E3779B97F4A7C15ull);
+}
+
 __device__ __forceinline__ unsigned long long
     pc_hash(unsigned long long parent, long long const *ids) {
-  unsigned long long h = parent ^ 0x9E3779B97F4A7C15ull;
+  unsigned long long bh = 0;
 #pragma unroll 8
   for (int i = 0; i < PC_PAGE_SIZE; i++) {
-    h ^= static_cast<unsigned long long>(ids[i]);
-    h *= 0xff51afd7ed558ccdull;
-    h ^= h >> 33;
+    bh ^= pc_id_hash(ids[i], i);
   }
-  return h;
+  return pc_chain_hash(parent, bh);
 }
 
 __device__ __forceinline__ bool pc_ids_equal(long long const *a,
@@ -379,6 +402,234 @@ __device__ __forceinline__ PcInsertResult
     ph = h;
   }
   return r;
+}
+
+
+// ── Warp-cooperative versions ───────────────────────────────────────────────
+// Executed by the lanes named in *mask* (the scheduler's helper lanes, 1..31),
+// each identified by an index l in [0, width). Every control decision is a
+// value all lanes compute identically (a reduction, a broadcast read of the
+// same address, or a ballot), so the loops stay convergent. The serial
+// functions above and these share the hash and the table layout exactly.
+
+struct PcLanes {
+  unsigned mask; // participating lanes
+  int l;         // this lane's index within the group
+  int width;     // group size
+};
+
+__device__ __forceinline__ unsigned long long
+    pc_w_xor_reduce(PcLanes const &w, unsigned long long v) {
+  unsigned lo = static_cast<unsigned>(v);
+  unsigned hi = static_cast<unsigned>(v >> 32);
+  lo = __reduce_xor_sync(w.mask, lo);
+  hi = __reduce_xor_sync(w.mask, hi);
+  return (static_cast<unsigned long long>(hi) << 32) | lo;
+}
+
+__device__ __forceinline__ unsigned long long
+    pc_w_hash(PcLanes const &w, unsigned long long parent, long long const *ids) {
+  unsigned long long bh = 0;
+  for (int i = w.l; i < PC_PAGE_SIZE; i += w.width) {
+    bh ^= pc_id_hash(ids[i], i);
+  }
+  return pc_chain_hash(parent, pc_w_xor_reduce(w, bh));
+}
+
+__device__ __forceinline__ bool pc_w_ids_equal(PcLanes const &w,
+                                               long long const *a,
+                                               long long const *b) {
+  bool ok = true;
+  for (int i = w.l; i < PC_PAGE_SIZE; i += w.width) {
+    ok = ok && (a[i] == b[i]);
+  }
+  return __all_sync(w.mask, ok);
+}
+
+__device__ __forceinline__ int pc_w_find(PcLanes const &w, PrefixEntry const *t,
+                                         unsigned long long h, int parent_slot,
+                                         long long const *ids) {
+  int s = static_cast<int>(h & PC_TABLE_MASK);
+  for (int probe = 0; probe < PC_TABLE_SIZE; probe++) {
+    PrefixEntry const &e = t[s];
+    int pid = e.page_id; // same address on every lane: a broadcast load
+    if (pid == PC_EMPTY) {
+      return -1;
+    }
+    bool head_ok = pid != PC_TOMBSTONE && e.hash == h &&
+                   e.parent_slot == parent_slot;
+    if (head_ok && pc_w_ids_equal(w, e.ids, ids)) {
+      return s;
+    }
+    s = (s + 1) & PC_TABLE_MASK;
+  }
+  return -1;
+}
+
+__device__ __forceinline__ int pc_w_insert(PcLanes const &w, PrefixEntry *t,
+                                           unsigned long long h, int parent_slot,
+                                           long long const *ids, int page_id,
+                                           unsigned lru) {
+  int s = static_cast<int>(h & PC_TABLE_MASK);
+  int target = -1;
+  for (int probe = 0; probe < PC_TABLE_SIZE; probe++) {
+    int pid = t[s].page_id;
+    if (pid == PC_TOMBSTONE && target < 0) {
+      target = s;
+    }
+    if (pid == PC_EMPTY) {
+      if (target < 0) {
+        target = s;
+      }
+      break;
+    }
+    s = (s + 1) & PC_TABLE_MASK;
+  }
+  if (target < 0) {
+    return -1;
+  }
+  PrefixEntry &e = t[target];
+  if (w.l == 0) {
+    e.hash = h;
+    e.parent_slot = parent_slot;
+    e.refcount = 0;
+    e.children = 0;
+    e.lru = lru;
+    e.ref = 1;
+    if (parent_slot >= 0) {
+      t[parent_slot].children++;
+    }
+  }
+  for (int i = w.l; i < PC_PAGE_SIZE; i += w.width) {
+    e.ids[i] = ids[i];
+  }
+  __syncwarp(w.mask);
+  if (w.l == 0) {
+    e.page_id = page_id; // publish last: a live page_id means a whole entry
+  }
+  __syncwarp(w.mask);
+  return target;
+}
+
+__device__ __forceinline__ int pc_w_match(PcLanes const &w, PrefixEntry const *t,
+                                          long long const *prompt, int prompt_len,
+                                          int max_pages, int *out_pages,
+                                          int *out_slots) {
+  int limit = (prompt_len - 1) / PC_PAGE_SIZE;
+  if (limit > max_pages) {
+    limit = max_pages;
+  }
+  int parent = -1;
+  unsigned long long ph = 0;
+  int n = 0;
+  for (int j = 0; j < limit; j++) {
+    long long const *ids = prompt + j * PC_PAGE_SIZE;
+    unsigned long long h = pc_w_hash(w, ph, ids);
+    int s = pc_w_find(w, t, h, parent, ids);
+    if (s < 0) {
+      break;
+    }
+    if (w.l == 0) {
+      out_pages[n] = t[s].page_id;
+      out_slots[n] = s;
+    }
+    n++;
+    parent = s;
+    ph = h;
+  }
+  __syncwarp(w.mask);
+  return n;
+}
+
+__device__ __forceinline__ PcInsertResult
+    pc_w_insert_sequence(PcLanes const &w, PrefixEntry *t, long long const *seq,
+                         int seq_len, int const *page_ids, int num_prefix,
+                         unsigned lru, int *page_slot) {
+  PcInsertResult r = {0, 0, 0, 0};
+  int full = seq_len > 0 ? seq_len / PC_PAGE_SIZE : 0;
+  int parent = -1;
+  unsigned long long ph = 0;
+  for (int j = 0; j < num_prefix && j < full; j++) {
+    long long const *ids = seq + j * PC_PAGE_SIZE;
+    unsigned long long h = pc_w_hash(w, ph, ids);
+    int s = pc_w_find(w, t, h, parent, ids);
+    if (s < 0) {
+      r.chain_dropped = 1;
+      return r;
+    }
+    parent = s;
+    ph = h;
+  }
+  for (int j = num_prefix; j < full; j++) {
+    long long const *ids = seq + j * PC_PAGE_SIZE;
+    unsigned long long h = pc_w_hash(w, ph, ids);
+    int s = pc_w_find(w, t, h, parent, ids);
+    if (s < 0) {
+      s = pc_w_insert(w, t, h, parent, ids, page_ids[j], lru);
+      if (s < 0) {
+        r.full = 1;
+        return r;
+      }
+      if (w.l == 0) {
+        page_slot[page_ids[j]] = s;
+      }
+      r.inserted++;
+    } else {
+      r.deduped++;
+    }
+    parent = s;
+    ph = h;
+  }
+  __syncwarp(w.mask);
+  return r;
+}
+
+// CLOCK sweep, *width* slots per step. Each lane inspects one slot and clears
+// its reference bit if it was set (its own slot: no race); the first lane
+// whose leaf had no reference bit wins the ballot and the group evicts it.
+// Same stall-flag contract as pc_evict_one.
+__device__ __forceinline__ int pc_w_evict_one(PcLanes const &w, PrefixEntry *t,
+                                              int *page_slot, int *ctl) {
+  if (ctl[PC_CTL_EVICT_STALL]) {
+    return -1;
+  }
+  int cursor = ctl[PC_CTL_CLOCK]; // broadcast read
+  int page = -1;
+  for (int visited = 0; visited < 2 * PC_TABLE_SIZE; visited += w.width) {
+    int s = (cursor + w.l) & PC_TABLE_MASK;
+    PrefixEntry &e = t[s];
+    bool leaf = e.page_id >= 0 && e.refcount == 0 && e.children == 0;
+    bool victim = false;
+    if (leaf) {
+      if (e.ref) {
+        e.ref = 0;
+      } else {
+        victim = true;
+      }
+    }
+    unsigned votes = __ballot_sync(w.mask, victim);
+    if (votes) {
+      // Lowest participating lane index among the voters.
+      int winner_lane = __ffs(votes) - 1;                 // hardware lane
+      int winner_l = winner_lane - (__ffs(w.mask) - 1);   // group index
+      int ws = (cursor + winner_l) & PC_TABLE_MASK;
+      page = t[ws].page_id;
+      if (w.l == 0) {
+        pc_erase(t, page_slot, page);
+        ctl[PC_CTL_CLOCK] = (ws + 1) & PC_TABLE_MASK;
+      }
+      __syncwarp(w.mask);
+      return page;
+    }
+    cursor = (cursor + w.width) & PC_TABLE_MASK;
+  }
+  if (w.l == 0) {
+    ctl[PC_CTL_CLOCK] = cursor;
+    ctl[PC_CTL_EVICT_STALL] = 1;
+    ctl[PC_STAT_EVICT_SWEEPS]++;
+  }
+  __syncwarp(w.mask);
+  return -1;
 }
 
 } // namespace runtime

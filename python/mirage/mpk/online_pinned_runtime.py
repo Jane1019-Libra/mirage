@@ -47,6 +47,7 @@ drives the ticks itself, so the snippet above works single-threaded too.
 
 import collections
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -57,7 +58,7 @@ import torch
 from .persistent_kernel import max_pages_per_request
 from .prefix_cache import EMPTY_MATCH, Block, PrefixCache, PrefixMatch
 from .gpu_prefix_cache import (
-    PC_CTL_ENABLED, PC_CTL_GEN_TAIL, PC_MODE_OFF, PC_MODE_OWNER,
+    PC_CTL_ENABLED, PC_CTL_GEN_TAIL, PC_CTL_WARP, PC_MODE_OFF, PC_MODE_OWNER,
     PC_MODE_SHADOW, check_structure, compare_with_cpu, decode_stats,
     decode_table,
 )
@@ -653,6 +654,10 @@ class OnlinePinnedRuntime:
             return
         self._pc_ctl[PC_CTL_ENABLED] = self._gpu_prefix_mode
         self._pc_ctl[PC_CTL_GEN_TAIL] = self._gen_tail_len
+        # The helper lanes are the default; MPK_GPU_PREFIX_SERIAL=1 keeps the
+        # serial path for an A/B on the same build.
+        self._pc_ctl[PC_CTL_WARP] = (
+            0 if os.environ.get("MPK_GPU_PREFIX_SERIAL") == "1" else 1)
 
     @property
     def gpu_prefix_enabled(self) -> bool:

@@ -503,6 +503,140 @@ __device__ __forceinline__ bool
 // (avail_uncommitted / reserved_remaining) makes the extra round trip safe: a
 // request is admitted only once its worst-case page budget is already free.
 
+// ── GPU prefix cache: helper lanes ─────────────────────────────────────────
+// prepare_next_batch runs on lane 0 of a scheduler warp; lanes 1..31 of that
+// warp otherwise do nothing for the life of the kernel. When the prefix cache
+// is on they wait on a per-warp shared-memory mailbox instead, and lane 0
+// hands them the match, the completion insert and the eviction sweep, which
+// they run 31-wide (pc_w_*). Lane 0's own code path is untouched: it posts a
+// request, spins on the reply, and reads the result. Independent thread
+// scheduling (sm_70+) keeps both sides of the warp making progress, and the
+// helpers synchronise only among themselves (mask 0xFFFFFFFE).
+struct PcMailbox {
+  int seq;   // lane 0 bumps it to post; helpers act on a change
+  int done;  // helpers write the seq they finished
+  int op;
+  int a0, a1, a2, a3;
+  unsigned tick;
+  int r0, r1, r2, r3;
+  int pages[MPK_MAX_PAGES_PER_REQ];
+  int slots[MPK_MAX_PAGES_PER_REQ];
+};
+constexpr int PC_OP_NONE = 0;
+constexpr int PC_OP_MATCH = 1;
+constexpr int PC_OP_INSERT = 2;
+constexpr int PC_OP_EVICT = 3;
+constexpr int PC_OP_EXIT = 4;
+constexpr unsigned PC_HELPER_MASK = 0xFFFFFFFEu;
+__shared__ PcMailbox pc_mailbox[4]; // one per scheduler warp of the block
+
+__device__ __forceinline__ void pc_helper_loop(RuntimeConfig const &config,
+                                               int lane,
+                                               PcMailbox volatile *mb) {
+  PcLanes w;
+  w.mask = PC_HELPER_MASK;
+  w.l = lane - 1;
+  w.width = 31;
+  PrefixEntry *table = static_cast<PrefixEntry *>(config.gpu_prefix_table);
+  int last = 0;
+  while (true) {
+    int seq;
+    while ((seq = mb->seq) == last) {
+      __nanosleep(64);
+    }
+    __threadfence_block();
+    last = seq;
+    int op = mb->op;
+    __syncwarp(PC_HELPER_MASK);
+    if (op == PC_OP_EXIT) {
+      break;
+    }
+    if (op == PC_OP_MATCH) {
+      int row = mb->a0;
+      int n = pc_w_match(w, table,
+                         &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                         mb->a1, mb->a2,
+                         const_cast<int *>(mb->pages),
+                         const_cast<int *>(mb->slots));
+      if (w.l == 0) {
+        mb->r0 = n;
+      }
+    } else if (op == PC_OP_INSERT) {
+      int row = mb->a0;
+      PcInsertResult r = pc_w_insert_sequence(
+          w, table, &config.tokens[row * MPK_MAX_SEQ_LENGTH], mb->a1,
+          &config.paged_kv_indices_buffer[mb->a2], mb->a3, mb->tick,
+          config.gpu_prefix_page_slot);
+      if (w.l == 0) {
+        mb->r0 = r.inserted;
+        mb->r1 = r.deduped;
+        mb->r2 = r.chain_dropped;
+        mb->r3 = r.full;
+      }
+    } else if (op == PC_OP_EVICT) {
+      int page = pc_w_evict_one(w, table, config.gpu_prefix_page_slot,
+                                config.gpu_prefix_ctl);
+      if (w.l == 0) {
+        mb->r0 = page;
+      }
+    }
+    __threadfence_block();
+    __syncwarp(PC_HELPER_MASK);
+    if (w.l == 0) {
+      mb->done = seq;
+    }
+  }
+}
+
+// Lane 0 side: post and wait. The mailbox pointer is null when the helpers
+// are not armed (cache off, or PC_CTL_WARP == 0), and the callers fall back
+// to the serial functions.
+__device__ __forceinline__ void pc_mb_post(PcMailbox volatile *mb, int op) {
+  mb->op = op;
+  __threadfence_block();
+  int seq = mb->seq + 1;
+  mb->seq = seq;
+  while (mb->done != seq) {
+    __nanosleep(32);
+  }
+  __threadfence_block();
+}
+
+__device__ __forceinline__ int pc_mb_match(PcMailbox volatile *mb, int row,
+                                           int prompt_len, int max_pages,
+                                           int *out_pages, int *out_slots) {
+  mb->a0 = row;
+  mb->a1 = prompt_len;
+  mb->a2 = max_pages;
+  pc_mb_post(mb, PC_OP_MATCH);
+  int n = mb->r0;
+  for (int j = 0; j < n; j++) {
+    out_pages[j] = mb->pages[j];
+    out_slots[j] = mb->slots[j];
+  }
+  return n;
+}
+
+__device__ __forceinline__ PcInsertResult pc_mb_insert(PcMailbox volatile *mb,
+                                                       int row, int seq_len,
+                                                       int kv_indptr,
+                                                       int num_prefix,
+                                                       unsigned tick) {
+  mb->a0 = row;
+  mb->a1 = seq_len;
+  mb->a2 = kv_indptr;
+  mb->a3 = num_prefix;
+  mb->tick = tick;
+  pc_mb_post(mb, PC_OP_INSERT);
+  PcInsertResult r = {mb->r0, mb->r1, mb->r2, mb->r3};
+  return r;
+}
+
+__device__ __forceinline__ int pc_mb_evict(PcMailbox volatile *mb) {
+  pc_mb_post(mb, PC_OP_EVICT);
+  return mb->r0;
+}
+
 // Per-iteration budget for the Step 0 drain. The scheduler lane is a single
 // thread reading pinned host memory across PCIe, so an unbounded drain would
 // put an arbitrarily long serial stall on the barrier point; the remainder is
@@ -543,6 +677,11 @@ __device__ __forceinline__ bool
   bool const pc_enabled = pc_mode != 0;
   bool const pc_owner = pc_mode == PC_MODE_OWNER;
   unsigned const pc_tick = static_cast<unsigned>(++pc_ctl[PC_CTL_TICK]);
+  // Helper lanes of this warp, if armed (see pc_helper_loop).
+  PcMailbox volatile *pc_mb =
+      (pc_enabled && pc_ctl[PC_CTL_WARP] != 0)
+          ? &pc_mailbox[(threadIdx.x / 32) & 3]
+          : nullptr;
 
   // Reclaim rows only after the CPU has copied their completed output and
   // release-stored -1 to pinned_step. The owner mapping stays stable for the
@@ -658,14 +797,17 @@ __device__ __forceinline__ bool
         int cacheable = prompt_len < final_kv_len ? prompt_len : final_kv_len;
         cacheable -= pc_ctl[PC_CTL_GEN_TAIL];
         unsigned long long t0 = pc_now_ns();
-        PcInsertResult r = pc_insert_sequence(
-            pc_table,
-            &config.tokens[row * MPK_MAX_SEQ_LENGTH],
-            cacheable,
-            &config.paged_kv_indices_buffer[kv_indptr],
-            config.gpu_row_num_prefix_pages[row],
-            pc_tick,
-            config.gpu_prefix_page_slot);
+        PcInsertResult r =
+            pc_mb ? pc_mb_insert(pc_mb, row, cacheable, kv_indptr,
+                                 config.gpu_row_num_prefix_pages[row], pc_tick)
+                  : pc_insert_sequence(
+                        pc_table,
+                        &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                        cacheable,
+                        &config.paged_kv_indices_buffer[kv_indptr],
+                        config.gpu_row_num_prefix_pages[row],
+                        pc_tick,
+                        config.gpu_prefix_page_slot);
         pc_add_ns(pc_ctl, PC_STAT_INSERT_NS, pc_now_ns() - t0);
         pc_ctl[PC_STAT_COMPLETIONS]++;
         pc_ctl[PC_STAT_INSERTED] += r.inserted;
@@ -822,12 +964,14 @@ __device__ __forceinline__ bool
             config.pinned_inbox_tokens[inbox_base + j];
       }
       unsigned long long t0 = pc_now_ns();
-      gpu_n = pc_match(pc_table,
-                       &config.tokens[row * MPK_MAX_SEQ_LENGTH],
-                       prompt_len,
-                       MPK_MAX_PAGES_PER_REQ,
-                       gpu_pages,
-                       gpu_slots);
+      gpu_n = pc_mb ? pc_mb_match(pc_mb, row, prompt_len,
+                                  MPK_MAX_PAGES_PER_REQ, gpu_pages, gpu_slots)
+                    : pc_match(pc_table,
+                               &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                               prompt_len,
+                               MPK_MAX_PAGES_PER_REQ,
+                               gpu_pages,
+                               gpu_slots);
       pc_add_ns(pc_ctl, PC_STAT_MATCH_NS, pc_now_ns() - t0);
       pc_ctl[PC_STAT_MATCH_CALLS]++;
       pc_ctl[PC_STAT_MATCH_PAGES] += gpu_n;
@@ -841,7 +985,9 @@ __device__ __forceinline__ bool
       if (avail_uncommitted < worst_need) {
         unsigned long long e0 = pc_now_ns();
         while (avail_uncommitted < worst_need) {
-          int page = pc_evict_one(pc_table, config.gpu_prefix_page_slot, pc_ctl);
+          int page = pc_mb ? pc_mb_evict(pc_mb)
+                           : pc_evict_one(pc_table,
+                                          config.gpu_prefix_page_slot, pc_ctl);
           if (page < 0) {
             break;
           }
@@ -885,12 +1031,14 @@ __device__ __forceinline__ bool
       // least one token is left to prefill. Nothing here changes what is
       // admitted; the result is only compared with the CPU's import.
       unsigned long long t0 = pc_now_ns();
-      int n = pc_match(pc_table,
-                       &config.tokens[row * MPK_MAX_SEQ_LENGTH],
-                       prompt_len,
-                       MPK_MAX_PAGES_PER_REQ,
-                       gpu_pages,
-                       gpu_slots);
+      int n = pc_mb ? pc_mb_match(pc_mb, row, prompt_len,
+                                  MPK_MAX_PAGES_PER_REQ, gpu_pages, gpu_slots)
+                    : pc_match(pc_table,
+                               &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                               prompt_len,
+                               MPK_MAX_PAGES_PER_REQ,
+                               gpu_pages,
+                               gpu_slots);
       pc_add_ns(pc_ctl, PC_STAT_MATCH_NS, pc_now_ns() - t0);
       pc_ctl[PC_STAT_MATCH_CALLS]++;
       pc_ctl[PC_STAT_MATCH_PAGES] += n;
@@ -1415,8 +1563,46 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
 }
 
 // need to alter as there is only one warp per block
+__device__ __forceinline__ void execute_scheduler_lane0(RuntimeConfig config,
+                                                        int offset);
+
 __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                                                   int offset) {
+#if defined(MODE_ONLINE_PINNED)
+  int const lane = threadIdx.x % 32;
+  int const warp_id = threadIdx.x / 32;
+  bool const sched_warp = warp_id < std::min((int)blockDim.x / 32, 4);
+  bool const helpers_armed =
+      sched_warp && config.gpu_prefix_ctl[PC_CTL_ENABLED] != 0 &&
+      config.gpu_prefix_ctl[PC_CTL_WARP] != 0;
+  if (helpers_armed) {
+    // The warp is still converged here: lane 0 initialises the mailbox and
+    // every lane sees it before anyone reads it.
+    PcMailbox volatile *mb = &pc_mailbox[warp_id & 3];
+    if (lane == 0) {
+      mb->seq = 0;
+      mb->done = 0;
+      mb->op = PC_OP_NONE;
+    }
+    __syncwarp();
+    if (lane != 0) {
+      pc_helper_loop(config, lane, mb);
+      return;
+    }
+    execute_scheduler_lane0(config, offset);
+    // The scheduler is done (termination event): release the helpers or the
+    // block never exits.
+    mb->op = PC_OP_EXIT;
+    __threadfence_block();
+    mb->seq = mb->seq + 1;
+    return;
+  }
+#endif
+  execute_scheduler_lane0(config, offset);
+}
+
+__device__ __forceinline__ void execute_scheduler_lane0(RuntimeConfig config,
+                                                        int offset) {
   int const num_schedulers =
       config.num_local_schedulers + config.num_remote_schedulers;
   // if we have more than 4 warps per thread block

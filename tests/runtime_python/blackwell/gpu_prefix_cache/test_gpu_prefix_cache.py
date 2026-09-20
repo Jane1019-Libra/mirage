@@ -7,6 +7,9 @@ full-hit clamp, per-id verification, parent-link verification, dedup,
 chain continuation from an imported prefix, broken-chain guard, table-full,
 and (increment 2) erase-by-page with tombstones that keep probe runs intact,
 and (increment 4) leaf-first CLOCK eviction that never takes a pinned block.
+The whole suite runs twice: once through the serial functions on one thread,
+once through the warp-cooperative pc_w_* functions on lanes 1..31 with lane 0
+idle, which is exactly how the scheduler's helper lanes run them.
 
 Run:  python test_gpu_prefix_cache.py      (or pytest)
 """
@@ -28,6 +31,43 @@ using namespace mirage::runtime;
 
 __global__ void k_reset(PrefixEntry *t) {
   for (int i = threadIdx.x; i < PC_TABLE_SIZE; i += blockDim.x) t[i].page_id = PC_EMPTY;
+}
+// Helper-lane group: lanes 1..31, lane 0 stays out (as in the scheduler).
+#define HELPERS 0xFFFFFFFEu
+__device__ __forceinline__ bool helper(PcLanes &w) {
+  int lane = threadIdx.x % 32;
+  w.mask = HELPERS; w.l = lane - 1; w.width = 31;
+  return lane != 0;
+}
+__global__ void kw_insert(PrefixEntry *t, long long const *seq, int seq_len,
+                          int const *pages, int num_prefix, unsigned lru,
+                          int *page_slot, int *out) {
+  PcLanes w;
+  if (!helper(w)) return;
+  PcInsertResult r = pc_w_insert_sequence(w, t, seq, seq_len, pages, num_prefix, lru, page_slot);
+  if (w.l == 0) { out[0] = r.inserted; out[1] = r.deduped; out[2] = r.chain_dropped; out[3] = r.full; }
+}
+__global__ void kw_match(PrefixEntry const *t, long long const *prompt, int len,
+                         int max_pages, int *pages, int *slots, int *out) {
+  PcLanes w;
+  if (!helper(w)) return;
+  int n = pc_w_match(w, t, prompt, len, max_pages, pages, slots);
+  if (w.l == 0) *out = n;
+}
+__global__ void kw_evict(PrefixEntry *t, int *page_slot, int *ctl, int *out) {
+  PcLanes w;
+  if (!helper(w)) return;
+  int page = pc_w_evict_one(w, t, page_slot, ctl);
+  if (w.l == 0) *out = page;
+}
+__global__ void k_hash_check(long long const *ids, int *out) {
+  // The serial and warp hashes must agree bit for bit.
+  __shared__ unsigned long long hs, hw;
+  PcLanes w;
+  if (threadIdx.x == 0) hs = pc_hash(12345ull, ids);
+  if (helper(w)) { unsigned long long h = pc_w_hash(w, 12345ull, ids); if (w.l == 0) hw = h; }
+  __syncthreads();
+  if (threadIdx.x == 0) *out = (hs == hw) ? 1 : 0;
 }
 __global__ void k_insert(PrefixEntry *t, long long const *seq, int seq_len,
                          int const *pages, int num_prefix, unsigned lru,
@@ -60,18 +100,30 @@ torch::Tensor make_table() {
   return t;
 }
 torch::Tensor insert_seq(torch::Tensor t, torch::Tensor seq, torch::Tensor pages, int num_prefix,
-                         int lru, torch::Tensor page_slot) {
+                         int lru, torch::Tensor page_slot, bool warp) {
   auto out = torch::zeros({4}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-  k_insert<<<1, 32>>>(reinterpret_cast<PrefixEntry *>(t.data_ptr()),
-                      reinterpret_cast<long long const *>(seq.data_ptr<int64_t>()), (int)seq.numel(),
-                      pages.data_ptr<int>(), num_prefix, (unsigned)lru,
-                      page_slot.data_ptr<int>(), out.data_ptr<int>());
+  auto tp = reinterpret_cast<PrefixEntry *>(t.data_ptr());
+  auto sp = reinterpret_cast<long long const *>(seq.data_ptr<int64_t>());
+  if (warp)
+    kw_insert<<<1, 32>>>(tp, sp, (int)seq.numel(), pages.data_ptr<int>(), num_prefix, (unsigned)lru,
+                         page_slot.data_ptr<int>(), out.data_ptr<int>());
+  else
+    k_insert<<<1, 32>>>(tp, sp, (int)seq.numel(), pages.data_ptr<int>(), num_prefix, (unsigned)lru,
+                        page_slot.data_ptr<int>(), out.data_ptr<int>());
   return out.cpu();
 }
-int evict_one(torch::Tensor t, torch::Tensor page_slot, torch::Tensor ctl) {
+int hash_agrees(torch::Tensor ids) {
   auto out = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-  k_evict<<<1, 32>>>(reinterpret_cast<PrefixEntry *>(t.data_ptr()), page_slot.data_ptr<int>(),
-                     ctl.data_ptr<int>(), out.data_ptr<int>());
+  k_hash_check<<<1, 32>>>(reinterpret_cast<long long const *>(ids.data_ptr<int64_t>()), out.data_ptr<int>());
+  return out.item<int>();
+}
+int evict_one(torch::Tensor t, torch::Tensor page_slot, torch::Tensor ctl, bool warp) {
+  auto out = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+  auto tp = reinterpret_cast<PrefixEntry *>(t.data_ptr());
+  if (warp)
+    kw_evict<<<1, 32>>>(tp, page_slot.data_ptr<int>(), ctl.data_ptr<int>(), out.data_ptr<int>());
+  else
+    k_evict<<<1, 32>>>(tp, page_slot.data_ptr<int>(), ctl.data_ptr<int>(), out.data_ptr<int>());
   return out.item<int>();
 }
 void pin(torch::Tensor t, torch::Tensor slots, int n, int delta) {
@@ -84,29 +136,33 @@ int erase_page(torch::Tensor t, torch::Tensor page_slot, int page) {
   return out.item<int>();
 }
 int match(torch::Tensor t, torch::Tensor prompt, int max_pages,
-          torch::Tensor pages, torch::Tensor slots) {
+          torch::Tensor pages, torch::Tensor slots, bool warp) {
   auto out = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-  k_match<<<1, 32>>>(reinterpret_cast<PrefixEntry const *>(t.data_ptr()),
-                     reinterpret_cast<long long const *>(prompt.data_ptr<int64_t>()), (int)prompt.numel(), max_pages,
-                     pages.data_ptr<int>(), slots.data_ptr<int>(), out.data_ptr<int>());
+  auto tp = reinterpret_cast<PrefixEntry const *>(t.data_ptr());
+  auto pp = reinterpret_cast<long long const *>(prompt.data_ptr<int64_t>());
+  if (warp)
+    kw_match<<<1, 32>>>(tp, pp, (int)prompt.numel(), max_pages, pages.data_ptr<int>(), slots.data_ptr<int>(), out.data_ptr<int>());
+  else
+    k_match<<<1, 32>>>(tp, pp, (int)prompt.numel(), max_pages, pages.data_ptr<int>(), slots.data_ptr<int>(), out.data_ptr<int>());
   return out.item<int>();
 }
 """
 
 CPP_SRC = r"""
 torch::Tensor make_table();
-torch::Tensor insert_seq(torch::Tensor, torch::Tensor, torch::Tensor, int, int, torch::Tensor);
+torch::Tensor insert_seq(torch::Tensor, torch::Tensor, torch::Tensor, int, int, torch::Tensor, bool);
 int erase_page(torch::Tensor, torch::Tensor, int);
-int evict_one(torch::Tensor, torch::Tensor, torch::Tensor);
+int evict_one(torch::Tensor, torch::Tensor, torch::Tensor, bool);
 void pin(torch::Tensor, torch::Tensor, int, int);
-int match(torch::Tensor, torch::Tensor, int, torch::Tensor, torch::Tensor);
+int match(torch::Tensor, torch::Tensor, int, torch::Tensor, torch::Tensor, bool);
+int hash_agrees(torch::Tensor);
 """
 
 ext = load_inline(
     name="gpu_prefix_cache_test",
     cpp_sources=CPP_SRC,
     cuda_sources=CUDA_SRC,
-    functions=["make_table", "insert_seq", "erase_page", "evict_one", "pin", "match"],
+    functions=["make_table", "insert_seq", "erase_page", "evict_one", "pin", "match", "hash_agrees"],
     extra_include_paths=[INCLUDE],
     extra_cuda_cflags=[f"-DPC_PAGE_SIZE={PS}", f"-DPC_TABLE_SIZE={TABLE}", "-O2"],
     verbose=False,
@@ -118,6 +174,9 @@ I32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
 
 
 NUM_PAGES = 4096  # page-id space of the owner map
+
+
+WARP = False  # which implementation the Cache wrapper drives
 
 
 class Cache:
@@ -132,7 +191,7 @@ class Cache:
         An imported page (j < num_prefix) owns the block from its own insert,
         a deduped page owns nothing, so kept reads the owner map.
         """
-        r = ext.insert_seq(self.t, I64(seq), I32(pages), num_prefix, lru, self.page_slot)
+        r = ext.insert_seq(self.t, I64(seq), I32(pages), num_prefix, lru, self.page_slot, WARP)
         self.last = dict(zip(("inserted", "deduped", "chain_dropped", "full"), r.tolist()))
         owned = self.page_slot[I32(pages).long()].tolist() if pages else []
         return self.last["inserted"], [int(s >= 0) for s in owned]
@@ -141,7 +200,7 @@ class Cache:
         return ext.erase_page(self.t, self.page_slot, page)
 
     def evict(self):
-        return ext.evict_one(self.t, self.page_slot, self.ctl)
+        return ext.evict_one(self.t, self.page_slot, self.ctl, WARP)
 
     def clear_stall(self):
         self.ctl[4] = 0  # what Step 1 does after a completion
@@ -150,14 +209,14 @@ class Cache:
         """Pin (+1) or unpin (-1) the chain a match of *prompt* finds."""
         slots = torch.full((16,), -1, dtype=torch.int32, device=dev)
         pages = torch.full((16,), -1, dtype=torch.int32, device=dev)
-        n = ext.match(self.t, I64(prompt), 16, pages, slots)
+        n = ext.match(self.t, I64(prompt), 16, pages, slots, WARP)
         ext.pin(self.t, slots, n, delta)
         return n
 
     def match(self, prompt, max_pages=16):
         pages = torch.full((16,), -1, dtype=torch.int32, device=dev)
         slots = torch.full((16,), -1, dtype=torch.int32, device=dev)
-        n = ext.match(self.t, I64(prompt), max_pages, pages, slots)
+        n = ext.match(self.t, I64(prompt), max_pages, pages, slots, WARP)
         return n, pages.tolist()[:n]
 
 
@@ -167,9 +226,13 @@ def check(name, got, want):
     return ok
 
 
-def run():
+def run_impl(warp):
+    global WARP
+    WARP = warp
+    print(f"\n===== {'warp-cooperative (lanes 1..31)' if warp else 'serial (one thread)'} =====")
     results = []
     A = list(range(1, 13))  # 3 pages: [1-4][5-8][9-12]
+    results.append(check("serial and warp hash agree", ext.hash_agrees(I64(list(range(100, 100 + PS)))), 1))
 
     print("insert / match basics")
     c = Cache()
@@ -258,6 +321,10 @@ def run():
     passed = sum(results)
     print(f"\n{passed}/{len(results)} passed")
     return passed == len(results)
+
+
+def run():
+    return run_impl(False) & run_impl(True)
 
 
 if __name__ == "__main__":

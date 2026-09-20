@@ -19,6 +19,7 @@ PC_CTL_SIZE = 32
 PC_CTL_ENABLED = 0  # 0 inert, 1 shadow (mirror the CPU cache), 2 owner
 PC_CTL_GEN_TAIL = 1
 PC_CTL_TICK = 2
+PC_CTL_WARP = 5  # 1: lanes 1..31 of the scheduler warp run the cache ops
 PC_MODE_OFF = 0
 PC_MODE_SHADOW = 1
 PC_MODE_OWNER = 2
@@ -155,6 +156,7 @@ def decode_stats(ctl: np.ndarray) -> Dict[str, float]:
     stats["enabled"] = int(ctl[PC_CTL_ENABLED])
     stats["gen_tail_len"] = int(ctl[PC_CTL_GEN_TAIL])
     stats["tick"] = int(ctl[PC_CTL_TICK])
+    stats["warp"] = int(ctl[PC_CTL_WARP])
     # Per-call cost on the scheduler lane, in microseconds.
     if stats["match_calls"]:
         stats["match_us_per_call"] = round(
