@@ -118,7 +118,12 @@ async def debug_prefix_cache(settle: float = 2.0):
     counters and a diff of the two indexes taken once the engine is idle."""
     runtime = app.state.engine.runtime
     report = {"cpu": await asyncio.to_thread(lambda: runtime.page_stats),
-              "gpu_mode": runtime.gpu_prefix_mode}
+              "gpu_mode": runtime.gpu_prefix_mode,
+              # Page conservation at quiesce: free + cached (+ pending
+              # returns, CPU mode) must equal the pool.
+              "pages": {"total": runtime.max_num_pages,
+                        "gpu_free": runtime.gpu_free_page_count,
+                        "pending_returns": runtime.pending_page_returns}}
     if runtime.gpu_prefix_enabled:
         report["gpu"] = await asyncio.to_thread(runtime.gpu_prefix_check, settle)
     return report

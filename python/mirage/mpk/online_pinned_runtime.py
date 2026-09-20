@@ -664,6 +664,10 @@ class OnlinePinnedRuntime:
         return self._gpu_prefix_enabled
 
     @property
+    def max_num_pages(self) -> int:
+        return self._max_num_pages
+
+    @property
     def gpu_prefix_mode(self) -> str:
         return {PC_MODE_OFF: "off", PC_MODE_SHADOW: "shadow",
                 PC_MODE_OWNER: "owner"}[self._gpu_prefix_mode]
