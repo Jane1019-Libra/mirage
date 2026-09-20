@@ -117,7 +117,8 @@ async def debug_prefix_cache(settle: float = 2.0):
     """CPU cache counters plus, with --gpu-prefix-cache, the GPU index's
     counters and a diff of the two indexes taken once the engine is idle."""
     runtime = app.state.engine.runtime
-    report = {"cpu": await asyncio.to_thread(lambda: runtime.page_stats)}
+    report = {"cpu": await asyncio.to_thread(lambda: runtime.page_stats),
+              "gpu_mode": runtime.gpu_prefix_mode}
     if runtime.gpu_prefix_enabled:
         report["gpu"] = await asyncio.to_thread(runtime.gpu_prefix_check, settle)
     return report
@@ -208,8 +209,10 @@ def main():
                         help="Resident pages for that cache (0 = auto: "
                              "max_num_pages - ceil(max_seq_length/page_size))")
     parser.add_argument("--gpu-prefix-cache", action="store_true",
-                        help="Experimental: mirror the prefix index on the GPU "
-                             "(shadow mode; diff it at GET /debug/prefix_cache)")
+                        help="Experimental: GPU-resident prefix cache owned by "
+                             "the kernel. With --enable-prefix-cache as well it "
+                             "only shadows the CPU cache; inspect either at "
+                             "GET /debug/prefix_cache")
     parser.add_argument("--output-dir", default=None, help="Output directory for compiled artifacts")
     parser.add_argument("--request-timeout", default=7200.0, type=float,
                         help="Per-request timeout in seconds (default: 7200)")

@@ -5,7 +5,8 @@ by eye, drives the device functions from single-thread kernels (the scheduler
 lane is single-thread too), and checks the CPU PrefixCache's semantics hold:
 full-hit clamp, per-id verification, parent-link verification, dedup,
 chain continuation from an imported prefix, broken-chain guard, table-full,
-and (increment 2) erase-by-page with tombstones that keep probe runs intact.
+and (increment 2) erase-by-page with tombstones that keep probe runs intact,
+and (increment 4) leaf-first CLOCK eviction that never takes a pinned block.
 
 Run:  python test_gpu_prefix_cache.py      (or pytest)
 """
@@ -39,6 +40,14 @@ __global__ void k_insert(PrefixEntry *t, long long const *seq, int seq_len,
 __global__ void k_erase(PrefixEntry *t, int *page_slot, int page, int *out) {
   if (threadIdx.x == 0) *out = pc_erase(t, page_slot, page);
 }
+__global__ void k_evict(PrefixEntry *t, int *page_slot, int *ctl, int *out) {
+  if (threadIdx.x == 0) *out = pc_evict_one(t, page_slot, ctl);
+}
+__global__ void k_pin(PrefixEntry *t, int const *slots, int n, int delta) {
+  if (threadIdx.x == 0) {
+    if (delta > 0) pc_pin_slots(t, slots, n, 1u); else pc_unpin_slots(t, slots, n);
+  }
+}
 __global__ void k_match(PrefixEntry const *t, long long const *prompt, int len,
                         int max_pages, int *pages, int *slots, int *out) {
   if (threadIdx.x == 0) *out = pc_match(t, prompt, len, max_pages, pages, slots);
@@ -58,6 +67,15 @@ torch::Tensor insert_seq(torch::Tensor t, torch::Tensor seq, torch::Tensor pages
                       pages.data_ptr<int>(), num_prefix, (unsigned)lru,
                       page_slot.data_ptr<int>(), out.data_ptr<int>());
   return out.cpu();
+}
+int evict_one(torch::Tensor t, torch::Tensor page_slot, torch::Tensor ctl) {
+  auto out = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+  k_evict<<<1, 32>>>(reinterpret_cast<PrefixEntry *>(t.data_ptr()), page_slot.data_ptr<int>(),
+                     ctl.data_ptr<int>(), out.data_ptr<int>());
+  return out.item<int>();
+}
+void pin(torch::Tensor t, torch::Tensor slots, int n, int delta) {
+  k_pin<<<1, 32>>>(reinterpret_cast<PrefixEntry *>(t.data_ptr()), slots.data_ptr<int>(), n, delta);
 }
 int erase_page(torch::Tensor t, torch::Tensor page_slot, int page) {
   auto out = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
@@ -79,6 +97,8 @@ CPP_SRC = r"""
 torch::Tensor make_table();
 torch::Tensor insert_seq(torch::Tensor, torch::Tensor, torch::Tensor, int, int, torch::Tensor);
 int erase_page(torch::Tensor, torch::Tensor, int);
+int evict_one(torch::Tensor, torch::Tensor, torch::Tensor);
+void pin(torch::Tensor, torch::Tensor, int, int);
 int match(torch::Tensor, torch::Tensor, int, torch::Tensor, torch::Tensor);
 """
 
@@ -86,7 +106,7 @@ ext = load_inline(
     name="gpu_prefix_cache_test",
     cpp_sources=CPP_SRC,
     cuda_sources=CUDA_SRC,
-    functions=["make_table", "insert_seq", "erase_page", "match"],
+    functions=["make_table", "insert_seq", "erase_page", "evict_one", "pin", "match"],
     extra_include_paths=[INCLUDE],
     extra_cuda_cflags=[f"-DPC_PAGE_SIZE={PS}", f"-DPC_TABLE_SIZE={TABLE}", "-O2"],
     verbose=False,
@@ -104,6 +124,7 @@ class Cache:
     def __init__(self):
         self.t = ext.make_table()
         self.page_slot = torch.full((NUM_PAGES,), -1, dtype=torch.int32, device=dev)
+        self.ctl = torch.zeros(32, dtype=torch.int32, device=dev)
 
     def insert(self, seq, pages, num_prefix=0, lru=0):
         """(inserted, kept) where kept[j] says page j now owns a block.
@@ -118,6 +139,20 @@ class Cache:
 
     def erase(self, page):
         return ext.erase_page(self.t, self.page_slot, page)
+
+    def evict(self):
+        return ext.evict_one(self.t, self.page_slot, self.ctl)
+
+    def clear_stall(self):
+        self.ctl[4] = 0  # what Step 1 does after a completion
+
+    def pin(self, prompt, delta):
+        """Pin (+1) or unpin (-1) the chain a match of *prompt* finds."""
+        slots = torch.full((16,), -1, dtype=torch.int32, device=dev)
+        pages = torch.full((16,), -1, dtype=torch.int32, device=dev)
+        n = ext.match(self.t, I64(prompt), 16, pages, slots)
+        ext.pin(self.t, slots, n, delta)
+        return n
 
     def match(self, prompt, max_pages=16):
         pages = torch.full((16,), -1, dtype=torch.int32, device=dev)
@@ -187,6 +222,28 @@ def run():
     # Tombstones are reusable capacity: the erased third fits again.
     refill = sum(c3.insert([3000 + k] * PS, [k])[0] for k in range(0, TABLE - 4, 3))
     results.append(check("erased slots accept new blocks", refill, len(range(0, TABLE - 4, 3))))
+
+    print("eviction (leaf-first CLOCK, pins respected)")
+    e = Cache()
+    e.insert(A, [10, 11, 12])                          # chain 10 -> 11 -> 12
+    e.insert([1, 2, 3, 4, 9, 9, 9, 9], [20, 21])       # 10 -> 21 (20 deduped)
+    first_two = {e.evict(), e.evict()}
+    results.append(check("leaves go first: {12, 21}", first_two, {12, 21}))
+    results.append(check("then 11 (now a leaf)", e.evict(), 11))
+    results.append(check("then the root 10", e.evict(), 10))
+    results.append(check("empty -> -1 and stall flag set", (e.evict(), int(e.ctl[4].item())), (-1, 1)))
+    results.append(check("nothing left to match", e.match(A + [13]), (0, [])))
+    e2 = Cache()
+    e2.insert(A, [10, 11, 12])
+    results.append(check("pin the chain (3 blocks)", e2.pin(A + [13], +1), 3))
+    results.append(check("pinned leaf: nothing evictable", e2.evict(), -1))
+    results.append(check("stall flag blocks further sweeps", e2.evict(), -1))
+    e2.pin(A + [13], -1)
+    results.append(check("unpinned but still stalled -> -1", e2.evict(), -1))
+    e2.clear_stall()
+    results.append(check("after Step-1 clear: leaf 12 evicted", e2.evict(), 12))
+    results.append(check("match now stops at 2 pages", e2.match(A + [13]), (2, [10, 11])))
+    results.append(check("re-insert tail reuses chain", e2.insert(A, [10, 11, 70], num_prefix=2), (1, [1, 1, 1])))
 
     print("table full")
     c2 = Cache()

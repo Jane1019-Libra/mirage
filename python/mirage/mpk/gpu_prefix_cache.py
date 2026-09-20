@@ -16,9 +16,12 @@ import numpy as np
 
 # Control-block layout (mirrors the PC_CTL_* constants in the header).
 PC_CTL_SIZE = 32
-PC_CTL_ENABLED = 0
+PC_CTL_ENABLED = 0  # 0 inert, 1 shadow (mirror the CPU cache), 2 owner
 PC_CTL_GEN_TAIL = 1
 PC_CTL_TICK = 2
+PC_MODE_OFF = 0
+PC_MODE_SHADOW = 1
+PC_MODE_OWNER = 2
 PC_STAT_NAMES = {
     8: "completions",
     9: "inserted",
@@ -33,9 +36,14 @@ PC_STAT_NAMES = {
     18: "match_shorter",
     19: "match_longer",
     20: "match_page_diff",
+    21: "evicted",
+    26: "freed",
+    27: "resident",
+    28: "admit_hold",
+    29: "evict_sweeps",
 }
 # 64-bit nanosecond accumulators, two consecutive ints each.
-PC_STAT_NS = {22: "match_ns", 24: "insert_ns"}
+PC_STAT_NS = {22: "match_ns", 24: "insert_ns", 30: "evict_ns"}
 
 PC_EMPTY = -1
 PC_TOMBSTONE = -2
@@ -48,7 +56,9 @@ def entry_dtype(page_size: int) -> np.dtype:
         ("page_id", "<i4"),
         ("parent_slot", "<i4"),
         ("refcount", "<i4"),
+        ("children", "<i4"),
         ("lru", "<u4"),
+        ("ref", "<i4"),
         ("ids", "<i8", (page_size,)),
     ])
 
@@ -65,6 +75,9 @@ class GpuBlock:
     page_id: int
     token_ids: Tuple[int, ...]
     parent_page_id: Optional[int]  # None for a root
+    parent_slot: int = -1
+    refcount: int = 0
+    children: int = 0
 
 
 def decode_table(raw: np.ndarray, page_size: int) -> Dict[int, GpuBlock]:
@@ -88,8 +101,49 @@ def decode_table(raw: np.ndarray, page_size: int) -> Dict[int, GpuBlock]:
             page_id=int(e["page_id"]),
             token_ids=tuple(int(x) for x in e["ids"]),
             parent_page_id=parent_page,
+            parent_slot=parent_slot,
+            refcount=int(e["refcount"]),
+            children=int(e["children"]),
         )
     return out
+
+
+def check_structure(gpu: Dict[int, GpuBlock], idle: bool) -> Dict[str, object]:
+    """Owner-mode self-consistency of a table snapshot.
+
+    Every parent link must point at a live block, every ``children`` count
+    must equal the number of live blocks naming that slot as parent, and when
+    the engine is idle no block may still be pinned.  Returns counts plus the
+    first few offenders of each kind.
+    """
+    by_slot = {b.slot: b for b in gpu.values()}
+    dangling = [b.page_id for b in gpu.values()
+                if b.parent_slot >= 0 and b.parent_slot not in by_slot]
+    counted: Dict[int, int] = {}
+    for b in gpu.values():
+        if b.parent_slot >= 0:
+            counted[b.parent_slot] = counted.get(b.parent_slot, 0) + 1
+    bad_children = [(b.page_id, b.children, counted.get(b.slot, 0))
+                    for b in gpu.values()
+                    if b.children != counted.get(b.slot, 0)]
+    pinned = [b.page_id for b in gpu.values() if b.refcount > 0]
+    negative = [b.page_id for b in gpu.values() if b.refcount < 0]
+    leaves = sum(1 for b in gpu.values() if b.children == 0)
+    errors = len(dangling) + len(bad_children) + len(negative)
+    if idle:
+        errors += len(pinned)
+    return {
+        "resident": len(gpu),
+        "leaves": leaves,
+        "pinned": len(pinned),
+        "structure_errors": errors,
+        "examples": {
+            "dangling_parent": dangling[:8],
+            "children_count": bad_children[:8],
+            "negative_refcount": negative[:8],
+            "pinned_while_idle": pinned[:8] if idle else [],
+        },
+    }
 
 
 def decode_stats(ctl: np.ndarray) -> Dict[str, float]:
@@ -108,6 +162,9 @@ def decode_stats(ctl: np.ndarray) -> Dict[str, float]:
     if stats["completions"]:
         stats["insert_us_per_completion"] = round(
             stats["insert_ns"] / stats["completions"] / 1e3, 2)
+    if stats["evicted"]:
+        stats["evict_us_per_block"] = round(
+            stats["evict_ns"] / stats["evicted"] / 1e3, 2)
     return stats
 
 

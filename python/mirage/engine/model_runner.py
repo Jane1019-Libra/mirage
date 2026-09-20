@@ -60,10 +60,11 @@ class RunnerConfig:
     still leaves one worst-case request admissible."""
 
     gpu_prefix_cache: bool = False
-    """Experimental: keep a GPU-resident copy of the prefix index, maintained
-    by the scheduler lane on the same completions and page returns the CPU
-    cache sees.  Shadow mode: the kernel does not act on it yet; the runtime
-    can diff it against the CPU cache (``gpu_prefix_check``)."""
+    """Experimental: a GPU-resident prefix index maintained by the scheduler
+    lane.  Alone, the kernel owns the cache (matches, imports, indexes, frees
+    and evicts by itself; ``enable_prefix_cache`` stays off).  Together with
+    ``enable_prefix_cache`` it only shadows the CPU cache, and the runtime
+    can diff the two (``gpu_prefix_check``)."""
 
     use_cutlass_kernel: bool = True
 
@@ -121,7 +122,7 @@ class ModelRunner:
         # measuring it once here keeps it out of the cacheable range.
         gen_tail_len = (
             compute_gen_tail_len(self.tokenizer)
-            if config.enable_prefix_cache else 0
+            if (config.enable_prefix_cache or config.gpu_prefix_cache) else 0
         )
         self.runtime = OnlinePinnedRuntime(
             self.mpk,

@@ -57,7 +57,8 @@ import torch
 from .persistent_kernel import max_pages_per_request
 from .prefix_cache import EMPTY_MATCH, Block, PrefixCache, PrefixMatch
 from .gpu_prefix_cache import (
-    PC_CTL_ENABLED, PC_CTL_GEN_TAIL, compare_with_cpu, decode_stats,
+    PC_CTL_ENABLED, PC_CTL_GEN_TAIL, PC_MODE_OFF, PC_MODE_OWNER,
+    PC_MODE_SHADOW, check_structure, compare_with_cpu, decode_stats,
     decode_table,
 )
 
@@ -182,13 +183,19 @@ class OnlinePinnedRuntime:
         self._published: Dict[int, _Published] = {}
         self._unadmitted: Deque[_Published] = collections.deque()
 
-        # GPU-resident prefix index (experimental, shadow mode).  The kernel
-        # maintains it from the same completions and page returns the CPU
-        # cache sees; the CPU only switches it on and reads it back.  The
-        # readback buffers are pinned and allocated here, up front: a host
-        # allocation under a running persistent kernel is not something to do
-        # on a debug path.
-        self._gpu_prefix_enabled = bool(gpu_prefix_cache and enable_prefix_cache)
+        # GPU-resident prefix index (experimental).  With the CPU cache on as
+        # well it runs in shadow mode: the kernel maintains it from the same
+        # completions and page returns the CPU cache sees, and the CPU can
+        # diff the two.  With the CPU cache off it is the owner: the kernel
+        # matches, pins, indexes, frees and evicts by itself, and this side
+        # neither matches nor returns pages.  The readback buffers are pinned
+        # and allocated here, up front: a host allocation under a running
+        # persistent kernel is not something to do on a debug path.
+        self._gpu_prefix_mode = PC_MODE_OFF
+        if gpu_prefix_cache:
+            self._gpu_prefix_mode = (
+                PC_MODE_SHADOW if enable_prefix_cache else PC_MODE_OWNER)
+        self._gpu_prefix_enabled = self._gpu_prefix_mode != PC_MODE_OFF
         self._pc_table = mpk.gpu_prefix_table
         self._pc_ctl = mpk.gpu_prefix_ctl
         self._pc_table_host: Optional[torch.Tensor] = None
@@ -511,6 +518,10 @@ class OnlinePinnedRuntime:
         the chain.  The rest go to the return ring, as they always did.
         """
         info = self._published.pop(rid, None)
+        if self._gpu_prefix_mode == PC_MODE_OWNER:
+            # The kernel cached or freed every page of this table itself
+            # before exporting it; the export is read-only for us.
+            return
         if self._cache is None or info is None or info.prompt_ids is None:
             self._return_pages_locked(pages)
             return
@@ -640,12 +651,17 @@ class OnlinePinnedRuntime:
         """
         if self._pc_ctl is None:
             return
-        self._pc_ctl[PC_CTL_ENABLED] = 1 if self._gpu_prefix_enabled else 0
+        self._pc_ctl[PC_CTL_ENABLED] = self._gpu_prefix_mode
         self._pc_ctl[PC_CTL_GEN_TAIL] = self._gen_tail_len
 
     @property
     def gpu_prefix_enabled(self) -> bool:
         return self._gpu_prefix_enabled
+
+    @property
+    def gpu_prefix_mode(self) -> str:
+        return {PC_MODE_OFF: "off", PC_MODE_SHADOW: "shadow",
+                PC_MODE_OWNER: "owner"}[self._gpu_prefix_mode]
 
     def _gpu_prefix_readback(self, with_table: bool):
         """Copy the control block (and optionally the table) to pinned host."""
@@ -663,14 +679,17 @@ class OnlinePinnedRuntime:
         return decode_stats(self._pc_ctl_host.numpy())
 
     def gpu_prefix_check(self, settle: float = 2.0) -> Dict[str, object]:
-        """Diff the GPU index against the CPU cache.
+        """Check the GPU index: against the CPU cache in shadow mode, against
+        itself in owner mode.
 
-        The two are maintained at different points of a request's life -- the
-        GPU indexes at completion, the CPU when it reaps that completion; the
-        CPU evicts, the GPU erases when the returned page is drained -- so
-        they only agree once nothing is in flight and the return ring is
-        drained.  Waits up to *settle* seconds for that, then snapshots both
-        under ``_owner_lock`` so the CPU side cannot move during the diff.
+        In shadow mode the two are maintained at different points of a
+        request's life -- the GPU indexes at completion, the CPU when it reaps
+        that completion; the CPU evicts, the GPU erases when the returned page
+        is drained -- so they only agree once nothing is in flight and the
+        return ring is drained.  Waits up to *settle* seconds for that, then
+        snapshots both under ``_owner_lock`` so the CPU side cannot move
+        during the diff.  In owner mode the snapshot is checked for structural
+        consistency (parent links, children counts, no pins while idle).
         """
         if not self._gpu_prefix_enabled:
             return {"enabled": 0}
@@ -690,7 +709,11 @@ class OnlinePinnedRuntime:
                            else dict(self._cache._by_page))
                     break
             time.sleep(0.01)
-        report = compare_with_cpu(gpu, cpu)
+        if self._gpu_prefix_mode == PC_MODE_OWNER:
+            report = check_structure(gpu, idle=quiescent)
+        else:
+            report = compare_with_cpu(gpu, cpu)
+        report["mode"] = self.gpu_prefix_mode
         report["quiescent"] = quiescent
         report["gpu_stats"] = stats
         return report

@@ -539,7 +539,9 @@ __device__ __forceinline__ bool
   // else reads the table during an iteration.
   PrefixEntry *pc_table = static_cast<PrefixEntry *>(config.gpu_prefix_table);
   int32_t *pc_ctl = config.gpu_prefix_ctl;
-  bool const pc_enabled = pc_ctl[PC_CTL_ENABLED] != 0;
+  int const pc_mode = pc_ctl[PC_CTL_ENABLED];
+  bool const pc_enabled = pc_mode != 0;
+  bool const pc_owner = pc_mode == PC_MODE_OWNER;
   unsigned const pc_tick = static_cast<unsigned>(++pc_ctl[PC_CTL_TICK]);
 
   // Reclaim rows only after the CPU has copied their completed output and
@@ -570,6 +572,7 @@ __device__ __forceinline__ bool
         // never cached); the index drops the block it owned, if any.
         if (pc_erase(pc_table, config.gpu_prefix_page_slot, page)) {
           pc_ctl[PC_STAT_ERASED]++;
+          pc_ctl[PC_STAT_RESIDENT]--;
         } else {
           pc_ctl[PC_STAT_ERASE_MISS]++;
         }
@@ -666,9 +669,33 @@ __device__ __forceinline__ bool
         pc_add_ns(pc_ctl, PC_STAT_INSERT_NS, pc_now_ns() - t0);
         pc_ctl[PC_STAT_COMPLETIONS]++;
         pc_ctl[PC_STAT_INSERTED] += r.inserted;
+        pc_ctl[PC_STAT_RESIDENT] += r.inserted;
         pc_ctl[PC_STAT_DEDUPED] += r.deduped;
         pc_ctl[PC_STAT_CHAIN_DROPPED] += r.chain_dropped;
         pc_ctl[PC_STAT_FULL] += r.full;
+
+        if (pc_owner) {
+          // The kernel owns the pages: the imported blocks lose this row's
+          // pin, and every page of the table that owns no block -- deduped,
+          // partial, generated -- goes straight back to the free queue. The
+          // CPU only reads the export; it returns nothing in this mode.
+          int npp = config.gpu_row_num_prefix_pages[row];
+          for (int j = 0; j < num_pages; j++) {
+            int page = config.paged_kv_indices_buffer[kv_indptr + j];
+            int s = config.gpu_prefix_page_slot[page];
+            if (j < npp && s >= 0) {
+              pc_table[s].refcount--;
+            }
+            if (s < 0) {
+              config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] = page;
+              page_queue_tail++;
+              avail_uncommitted++;
+              pc_ctl[PC_STAT_FREED]++;
+            }
+          }
+          // Pins dropped and blocks added: a sweep may find something again.
+          pc_ctl[PC_CTL_EVICT_STALL] = 0;
+        }
       }
 
       // Retain the row and owner until the CPU acknowledges its completed
@@ -778,31 +805,85 @@ __device__ __forceinline__ bool
     // the reservation, so an admitted request can never be outbid mid-flight
     // and the page queue can never underflow.
     int worst_need = MPK_MAX_PAGES_PER_REQ - num_prefix_pages;
-    if (avail_uncommitted < worst_need) {
-      break;
+    int row;
+    int inbox_base = req_slot * MPK_MAX_SEQ_LENGTH;
+    // Owner mode: the match needs the prompt in device memory, so the row is
+    // popped and filled before the gate; a refused admission hands it back.
+    int gpu_pages[MPK_MAX_PAGES_PER_REQ];
+    int gpu_slots[MPK_MAX_PAGES_PER_REQ];
+    int gpu_n = 0;
+    // A caller-chosen start (initial_step != 0) disables matching, as on
+    // the CPU: the two cannot both set it.
+    bool const owner_match = pc_owner && initial_step == 0;
+    if (owner_match) {
+      row = config.free_rows[--free_row_top];
+      for (int j = 0; j < prompt_len; j++) {
+        config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
+            config.pinned_inbox_tokens[inbox_base + j];
+      }
+      unsigned long long t0 = pc_now_ns();
+      gpu_n = pc_match(pc_table,
+                       &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                       prompt_len,
+                       MPK_MAX_PAGES_PER_REQ,
+                       gpu_pages,
+                       gpu_slots);
+      pc_add_ns(pc_ctl, PC_STAT_MATCH_NS, pc_now_ns() - t0);
+      pc_ctl[PC_STAT_MATCH_CALLS]++;
+      pc_ctl[PC_STAT_MATCH_PAGES] += gpu_n;
+      // Pin before evicting so the sweep cannot take what was just matched.
+      pc_pin_slots(pc_table, gpu_slots, gpu_n, pc_tick);
+      num_prefix_pages = gpu_n;
+      initial_step = gpu_n * MPK_PAGE_SIZE;
+      worst_need = MPK_MAX_PAGES_PER_REQ - gpu_n;
+      // Evict on demand: cached pages are the pool's slack. A page freed
+      // here is uncommitted again; the ledger identity holds.
+      if (avail_uncommitted < worst_need) {
+        unsigned long long e0 = pc_now_ns();
+        while (avail_uncommitted < worst_need) {
+          int page = pc_evict_one(pc_table, config.gpu_prefix_page_slot, pc_ctl);
+          if (page < 0) {
+            break;
+          }
+          config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] = page;
+          page_queue_tail++;
+          avail_uncommitted++;
+          pc_ctl[PC_STAT_EVICTED]++;
+          pc_ctl[PC_STAT_RESIDENT]--;
+        }
+        pc_add_ns(pc_ctl, PC_STAT_EVICT_NS, pc_now_ns() - e0);
+      }
+      if (avail_uncommitted < worst_need) {
+        // Every leaf is pinned: the pool is committed to running requests.
+        // Undo and retry next iteration, like the plain gate below.
+        pc_unpin_slots(pc_table, gpu_slots, gpu_n);
+        config.free_rows[free_row_top++] = row;
+        pc_ctl[PC_STAT_ADMIT_HOLD]++;
+        break;
+      }
+    } else {
+      if (avail_uncommitted < worst_need) {
+        break;
+      }
+      // Pop a free buffer row and copy inbox tokens from this ring slot.
+      row = config.free_rows[--free_row_top];
+      for (int j = 0; j < prompt_len; j++) {
+        config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
+            config.pinned_inbox_tokens[inbox_base + j];
+      }
     }
     avail_uncommitted -= worst_need;
-
-    // Pop a free buffer row and copy inbox tokens from this ring slot.
-    int row = config.free_rows[--free_row_top];
     config.reserved_remaining[row] = worst_need;
     config.gpu_row_num_prefix_pages[row] = num_prefix_pages;
-    int inbox_base = req_slot * MPK_MAX_SEQ_LENGTH;
-    for (int j = 0; j < prompt_len; j++) {
-      config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
-          config.pinned_inbox_tokens[inbox_base + j];
-    }
     config.prompt_length[row] = prompt_len;
     config.step[row] = initial_step;
 
-    if (pc_enabled) {
+    if (pc_enabled && !pc_owner) {
       // Shadow match against the row's own copy of the prompt (device memory;
       // the inbox is pinned host memory and would be hashed across PCIe).
       // Same inputs as PrefixCache.match: the whole prompt, capped so at
       // least one token is left to prefill. Nothing here changes what is
       // admitted; the result is only compared with the CPU's import.
-      int gpu_pages[MPK_MAX_PAGES_PER_REQ];
-      int gpu_slots[MPK_MAX_PAGES_PER_REQ];
       unsigned long long t0 = pc_now_ns();
       int n = pc_match(pc_table,
                        &config.tokens[row * MPK_MAX_SEQ_LENGTH],
@@ -853,11 +934,13 @@ __device__ __forceinline__ bool
         paged_kv_last_page_len(initial_step + num_new_tokens);
 
     // Two-phase page-table fill: slots below num_prefix_pages are imported
-    // from the CPU's prefix array, the rest are fresh pages off the queue.
+    // from the CPU's prefix array (or the kernel's own match in owner mode),
+    // the rest are fresh pages off the queue.
     for (int j = 0; j < num_new_pages; j++) {
       if (j < num_prefix_pages) {
         config.paged_kv_indices_buffer[num_pages + j] =
-            config.pinned_req_prefix_pages[prefix_page_base + j];
+            owner_match ? gpu_pages[j]
+                        : config.pinned_req_prefix_pages[prefix_page_base + j];
       } else {
         config.paged_kv_indices_buffer[num_pages + j] =
             config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];

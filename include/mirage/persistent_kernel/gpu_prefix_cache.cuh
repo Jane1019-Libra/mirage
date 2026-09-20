@@ -24,6 +24,10 @@
 // Increment 3: a shadow match at admission, compared against the prefix the
 //   CPU imported for the same request, and nanosecond accounting of both the
 //   match and the insert so their cost on the scheduler lane is measurable.
+// Increment 4: the kernel owns the cache (ctl mode 2). Step 4 matches, pins
+//   and imports; Step 1 unpins, indexes and frees the rest of the page table
+//   itself; admission evicts on demand, leaf-first, by a CLOCK sweep over the
+//   table. The CPU cache and the page-return channel are idle in this mode.
 //
 // Semantics are the CPU PrefixCache's (§6.4 v2.1-b), not an approximation of
 // them: a block is keyed by the chained hash h_j = H(h_{j-1}, ids_j), and a
@@ -33,7 +37,9 @@
 //
 // Open addressing with linear probing. Erase leaves a tombstone so the probe
 // runs through it stay intact; insert reuses the first tombstone of its run.
-// No eviction of its own yet: a full table simply stops accepting inserts.
+// Eviction is leaf-first (children == 0) and never touches a pinned block
+// (refcount > 0): an inner block's KV is only reachable through its
+// descendants, and a pinned block is being read by a running request.
 //
 // PC_PAGE_SIZE / PC_TABLE_SIZE are macros so a unit test can build a tiny
 // table with 4-token pages and read the results by eye.
@@ -58,21 +64,27 @@ struct PrefixEntry {
   unsigned long long hash; // chained hash of this block
   int page_id;             // PC_EMPTY / PC_TOMBSTONE: slot unused
   int parent_slot;         // slot of the preceding block, -1 for a root
-  int refcount;            // in-flight importers (eviction guard, later)
-  unsigned lru;            // last-touched tick (eviction order, later)
+  int refcount;            // running requests reading this block (pin)
+  int children;            // live blocks whose parent this is
+  unsigned lru;            // tick of the last insert or hit (observability)
+  int ref;                 // CLOCK reference bit: set on insert/hit
   long long ids[PC_PAGE_SIZE]; // the tokens, for verification on hit
 };
 // The Python side decodes the table with a structured dtype of this layout.
-static_assert(sizeof(PrefixEntry) == 24 + 8 * PC_PAGE_SIZE,
+static_assert(sizeof(PrefixEntry) == 32 + 8 * PC_PAGE_SIZE,
               "PrefixEntry layout drifted from the Python decoder");
 
 // Control block shared with Python: parameters below PC_CTL_STATS, counters
 // from it. Both live in one int32 device array so the meta-tensor plumbing
 // grows by two entries (table + ctl), not a dozen.
 constexpr int PC_CTL_SIZE = 32;
-constexpr int PC_CTL_ENABLED = 0;  // Python-written: 0 leaves the kernel inert
+constexpr int PC_CTL_ENABLED = 0;  // Python-written: 0 inert, 1 shadow, 2 owner
 constexpr int PC_CTL_GEN_TAIL = 1; // Python-written: prompt tail never cached
 constexpr int PC_CTL_TICK = 2;     // GPU-written: iterations since launch (lru)
+constexpr int PC_CTL_CLOCK = 3;    // GPU-written: CLOCK sweep cursor
+constexpr int PC_CTL_EVICT_STALL = 4; // GPU-written: a full sweep found nothing
+constexpr int PC_MODE_SHADOW = 1;
+constexpr int PC_MODE_OWNER = 2;
 constexpr int PC_CTL_STATS = 8;
 constexpr int PC_STAT_COMPLETIONS = 8;   // completions the table saw
 constexpr int PC_STAT_INSERTED = 9;      // blocks added
@@ -91,9 +103,15 @@ constexpr int PC_STAT_MATCH_CPU_PAGES = 17; // pages the CPU imported
 constexpr int PC_STAT_MATCH_SHORTER = 18;   // requests where GPU < CPU
 constexpr int PC_STAT_MATCH_LONGER = 19;    // requests where GPU > CPU
 constexpr int PC_STAT_MATCH_PAGE_DIFF = 20; // common prefix names other pages
+constexpr int PC_STAT_EVICTED = 21;         // owner mode: blocks evicted
 // Nanoseconds on the scheduler lane, 64-bit across two consecutive ints.
 constexpr int PC_STAT_MATCH_NS = 22;  // [22..23]
 constexpr int PC_STAT_INSERT_NS = 24; // [24..25]
+constexpr int PC_STAT_FREED = 26;       // owner mode: pages freed at completion
+constexpr int PC_STAT_RESIDENT = 27;    // live blocks (== pages the cache holds)
+constexpr int PC_STAT_ADMIT_HOLD = 28;  // owner mode: gate failed after evicting
+constexpr int PC_STAT_EVICT_SWEEPS = 29; // owner mode: fruitless full sweeps
+constexpr int PC_STAT_EVICT_NS = 30;    // [30..31]
 
 __device__ __forceinline__ unsigned long long pc_now_ns() {
   unsigned long long t;
@@ -185,9 +203,14 @@ __device__ __forceinline__ int pc_insert(PrefixEntry *t,
   e.parent_slot = parent_slot;
   e.page_id = page_id;
   e.refcount = 0;
+  e.children = 0;
   e.lru = lru;
+  e.ref = 1;
   for (int i = 0; i < PC_PAGE_SIZE; i++) {
     e.ids[i] = ids[i];
+  }
+  if (parent_slot >= 0) {
+    t[parent_slot].children++;
   }
   return target;
 }
@@ -201,9 +224,66 @@ __device__ __forceinline__ int pc_erase(PrefixEntry *t, int *page_slot,
   if (s < 0) {
     return 0;
   }
+  int parent = t[s].parent_slot;
+  if (parent >= 0 && t[parent].page_id >= 0) {
+    t[parent].children--;
+  }
   t[s].page_id = PC_TOMBSTONE;
   page_slot[page] = -1;
   return 1;
+}
+
+// Owner mode. Evict one block and return its page, or -1 when nothing can
+// go. CLOCK over the table: a slot is skipped if unused, pinned or not a
+// leaf; a leaf with its reference bit set gets a second chance; the first
+// leaf without one is evicted. Once a full sweep finds nothing, every leaf is
+// pinned -- the pool is committed to running requests -- and sweeping again
+// before a completion would only burn the scheduler lane, so a stall flag
+// short-circuits until Step 1 clears it.
+__device__ __forceinline__ int pc_evict_one(PrefixEntry *t, int *page_slot,
+                                            int *ctl) {
+  if (ctl[PC_CTL_EVICT_STALL]) {
+    return -1;
+  }
+  int cursor = ctl[PC_CTL_CLOCK];
+  for (int visited = 0; visited < 2 * PC_TABLE_SIZE; visited++) {
+    PrefixEntry &e = t[cursor];
+    cursor = (cursor + 1) & PC_TABLE_MASK;
+    if (e.page_id < 0 || e.refcount > 0 || e.children > 0) {
+      continue;
+    }
+    if (e.ref) {
+      e.ref = 0;
+      continue;
+    }
+    int page = e.page_id;
+    pc_erase(t, page_slot, page);
+    ctl[PC_CTL_CLOCK] = cursor;
+    return page;
+  }
+  ctl[PC_CTL_CLOCK] = cursor;
+  ctl[PC_CTL_EVICT_STALL] = 1;
+  ctl[PC_STAT_EVICT_SWEEPS]++;
+  return -1;
+}
+
+// Owner mode: pin the matched chain (Step 4) or release it (Step 1 / a
+// refused admission). A pinned block is touched for CLOCK too.
+__device__ __forceinline__ void pc_pin_slots(PrefixEntry *t, int const *slots,
+                                             int n, unsigned tick) {
+  for (int j = 0; j < n; j++) {
+    PrefixEntry &e = t[slots[j]];
+    e.refcount++;
+    e.ref = 1;
+    e.lru = tick;
+  }
+}
+
+__device__ __forceinline__ void pc_unpin_slots(PrefixEntry *t,
+                                               int const *slots, int n) {
+  for (int j = 0; j < n; j++) {
+    t[slots[j]].refcount--;
+  }
 }
 
 // Longest verified cached prefix of prompt[0, prompt_len). Writes the page ids
