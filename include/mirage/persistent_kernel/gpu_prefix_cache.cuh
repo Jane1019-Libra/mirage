@@ -21,6 +21,9 @@
 // Increment 2: deletion (tombstones) and a page -> slot map, so the scheduler
 //   lane can mirror the CPU PrefixCache: insert on completion, erase when the
 //   CPU returns a cached page. The kernel does not act on the table yet.
+// Increment 3: a shadow match at admission, compared against the prefix the
+//   CPU imported for the same request, and nanosecond accounting of both the
+//   match and the insert so their cost on the scheduler lane is measurable.
 //
 // Semantics are the CPU PrefixCache's (§6.4 v2.1-b), not an approximation of
 // them: a block is keyed by the chained hash h_j = H(h_{j-1}, ids_j), and a
@@ -78,6 +81,32 @@ constexpr int PC_STAT_CHAIN_DROPPED = 11; // imported parent gone; tail dropped
 constexpr int PC_STAT_FULL = 12;         // inserts refused by a full table
 constexpr int PC_STAT_ERASED = 13;       // blocks removed on page return
 constexpr int PC_STAT_ERASE_MISS = 14;   // returned pages that owned no block
+// Shadow match (increment 3): the GPU matches the prompt at admission and
+// compares with the prefix the CPU imported for the same request. The CPU
+// matched earlier (at publish) and under a pin budget, so the GPU may find
+// more; finding less, or different pages, would be a bug.
+constexpr int PC_STAT_MATCH_CALLS = 15;
+constexpr int PC_STAT_MATCH_PAGES = 16;     // pages the GPU match found
+constexpr int PC_STAT_MATCH_CPU_PAGES = 17; // pages the CPU imported
+constexpr int PC_STAT_MATCH_SHORTER = 18;   // requests where GPU < CPU
+constexpr int PC_STAT_MATCH_LONGER = 19;    // requests where GPU > CPU
+constexpr int PC_STAT_MATCH_PAGE_DIFF = 20; // common prefix names other pages
+// Nanoseconds on the scheduler lane, 64-bit across two consecutive ints.
+constexpr int PC_STAT_MATCH_NS = 22;  // [22..23]
+constexpr int PC_STAT_INSERT_NS = 24; // [24..25]
+
+__device__ __forceinline__ unsigned long long pc_now_ns() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
+  return t;
+}
+
+__device__ __forceinline__ void pc_add_ns(int *ctl, int idx,
+                                          unsigned long long ns) {
+  unsigned long long *acc =
+      reinterpret_cast<unsigned long long *>(ctl + idx);
+  *acc += ns;
+}
 
 // 64-bit multiply-xorshift mix. Not cryptographic and does not need to be:
 // every hit is verified against the stored ids, so a collision costs a probe,

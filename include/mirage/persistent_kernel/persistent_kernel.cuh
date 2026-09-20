@@ -654,6 +654,7 @@ __device__ __forceinline__ bool
         int final_kv_len = step + num_tokens;
         int cacheable = prompt_len < final_kv_len ? prompt_len : final_kv_len;
         cacheable -= pc_ctl[PC_CTL_GEN_TAIL];
+        unsigned long long t0 = pc_now_ns();
         PcInsertResult r = pc_insert_sequence(
             pc_table,
             &config.tokens[row * MPK_MAX_SEQ_LENGTH],
@@ -662,6 +663,7 @@ __device__ __forceinline__ bool
             config.gpu_row_num_prefix_pages[row],
             pc_tick,
             config.gpu_prefix_page_slot);
+        pc_add_ns(pc_ctl, PC_STAT_INSERT_NS, pc_now_ns() - t0);
         pc_ctl[PC_STAT_COMPLETIONS]++;
         pc_ctl[PC_STAT_INSERTED] += r.inserted;
         pc_ctl[PC_STAT_DEDUPED] += r.deduped;
@@ -792,6 +794,39 @@ __device__ __forceinline__ bool
     }
     config.prompt_length[row] = prompt_len;
     config.step[row] = initial_step;
+
+    if (pc_enabled) {
+      // Shadow match against the row's own copy of the prompt (device memory;
+      // the inbox is pinned host memory and would be hashed across PCIe).
+      // Same inputs as PrefixCache.match: the whole prompt, capped so at
+      // least one token is left to prefill. Nothing here changes what is
+      // admitted; the result is only compared with the CPU's import.
+      int gpu_pages[MPK_MAX_PAGES_PER_REQ];
+      int gpu_slots[MPK_MAX_PAGES_PER_REQ];
+      unsigned long long t0 = pc_now_ns();
+      int n = pc_match(pc_table,
+                       &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                       prompt_len,
+                       MPK_MAX_PAGES_PER_REQ,
+                       gpu_pages,
+                       gpu_slots);
+      pc_add_ns(pc_ctl, PC_STAT_MATCH_NS, pc_now_ns() - t0);
+      pc_ctl[PC_STAT_MATCH_CALLS]++;
+      pc_ctl[PC_STAT_MATCH_PAGES] += n;
+      pc_ctl[PC_STAT_MATCH_CPU_PAGES] += num_prefix_pages;
+      if (n < num_prefix_pages) {
+        pc_ctl[PC_STAT_MATCH_SHORTER]++;
+      } else if (n > num_prefix_pages) {
+        pc_ctl[PC_STAT_MATCH_LONGER]++;
+      }
+      int common = n < num_prefix_pages ? n : num_prefix_pages;
+      for (int j = 0; j < common; j++) {
+        if (gpu_pages[j] != config.pinned_req_prefix_pages[prefix_page_base + j]) {
+          pc_ctl[PC_STAT_MATCH_PAGE_DIFF]++;
+          break;
+        }
+      }
+    }
     // Reset progress before release-publishing the owner. An observer that
     // finds new_rid must not see progress or tokens from the prior lease.
     st_release_sys_i32(&config.pinned_step[row], initial_step);

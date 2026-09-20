@@ -27,7 +27,15 @@ PC_STAT_NAMES = {
     12: "full",
     13: "erased",
     14: "erase_miss",
+    15: "match_calls",
+    16: "match_pages",
+    17: "match_cpu_pages",
+    18: "match_shorter",
+    19: "match_longer",
+    20: "match_page_diff",
 }
+# 64-bit nanosecond accumulators, two consecutive ints each.
+PC_STAT_NS = {22: "match_ns", 24: "insert_ns"}
 
 PC_EMPTY = -1
 PC_TOMBSTONE = -2
@@ -84,11 +92,22 @@ def decode_table(raw: np.ndarray, page_size: int) -> Dict[int, GpuBlock]:
     return out
 
 
-def decode_stats(ctl: np.ndarray) -> Dict[str, int]:
-    stats = {name: int(ctl[idx]) for idx, name in PC_STAT_NAMES.items()}
+def decode_stats(ctl: np.ndarray) -> Dict[str, float]:
+    stats: Dict[str, float] = {
+        name: int(ctl[idx]) for idx, name in PC_STAT_NAMES.items()}
+    ctl64 = np.ascontiguousarray(ctl).view("<i8")
+    for idx, name in PC_STAT_NS.items():
+        stats[name] = int(ctl64[idx // 2])
     stats["enabled"] = int(ctl[PC_CTL_ENABLED])
     stats["gen_tail_len"] = int(ctl[PC_CTL_GEN_TAIL])
     stats["tick"] = int(ctl[PC_CTL_TICK])
+    # Per-call cost on the scheduler lane, in microseconds.
+    if stats["match_calls"]:
+        stats["match_us_per_call"] = round(
+            stats["match_ns"] / stats["match_calls"] / 1e3, 2)
+    if stats["completions"]:
+        stats["insert_us_per_completion"] = round(
+            stats["insert_ns"] / stats["completions"] / 1e3, 2)
     return stats
 
 
