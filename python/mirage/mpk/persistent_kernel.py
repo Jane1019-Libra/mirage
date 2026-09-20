@@ -42,6 +42,18 @@ def page_return_ring_capacity(max_num_pages: int) -> int:
     return capacity
 
 
+def gpu_prefix_table_size(max_num_pages: int) -> int:
+    """Slots in the GPU prefix index (``PC_TABLE_SIZE``).
+
+    Every cached page owns one slot, so the pool bounds the occupancy; a
+    power of two at least twice that keeps linear probing's runs short.
+    """
+    size = 1024
+    while size < 2 * max_num_pages:
+        size *= 2
+    return size
+
+
 HARD_CODE = """
 #include <Python.h>
 #include <cstdint>
@@ -322,7 +334,8 @@ def get_compile_command(
         flags = flags + ["-DMODE_ONLINE_PINNED",
                          f"-DMPK_PINNED_RING_CAPACITY={mpk.pinned_ring_capacity}",
                          f"-DMPK_MAX_PAGES_PER_REQ={mpk.max_pages_per_request}",
-                         f"-DMPK_PAGE_RETURN_RING_CAPACITY={mpk.page_return_ring_capacity}"]
+                         f"-DMPK_PAGE_RETURN_RING_CAPACITY={mpk.page_return_ring_capacity}",
+                         f"-DPC_TABLE_SIZE={gpu_prefix_table_size(mpk.max_num_pages)}"]
     else:
         raise ValueError(f"Invalid persistent kernel mode: {mpk.mode}")
 
@@ -3139,6 +3152,8 @@ class PersistentKernel:
             "pinned_page_return_tail",
             "pinned_page_return_head_mirror",
             "pinned_page_free_count_mirror",
+            "gpu_prefix_table",
+            "gpu_prefix_ctl",
         ]
         meta_tensors_ptr = []
         for key in expected_order:
@@ -3272,6 +3287,8 @@ class PersistentKernel:
             meta_tensors.append(self.meta_tensors["pinned_page_return_tail"])
             meta_tensors.append(self.meta_tensors["pinned_page_return_head_mirror"])
             meta_tensors.append(self.meta_tensors["pinned_page_free_count_mirror"])
+            meta_tensors.append(self.meta_tensors["gpu_prefix_table"])
+            meta_tensors.append(self.meta_tensors["gpu_prefix_ctl"])
         meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
         profiler_buffer_ptr = (
             self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0

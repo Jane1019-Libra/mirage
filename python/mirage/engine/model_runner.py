@@ -13,10 +13,12 @@ from ..mpk.mpk import MPK, MPKMetadata
 from ..mpk import OnlinePinnedRuntime
 from ..mpk.models.graph_builder import MirageModelConfig
 from ..mpk.persistent_kernel import (
+    gpu_prefix_table_size,
     max_pages_per_request,
     page_return_ring_capacity,
 )
 from ..mpk.prefix_cache import compute_gen_tail_len
+from ..mpk.gpu_prefix_cache import PC_CTL_SIZE, table_bytes
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -56,6 +58,12 @@ class RunnerConfig:
     """Resident-page budget for that cache.  ``0`` auto-sizes it to
     ``max_num_pages - ceil(max_seq_length / page_size)``, the largest cache that
     still leaves one worst-case request admissible."""
+
+    gpu_prefix_cache: bool = False
+    """Experimental: keep a GPU-resident copy of the prefix index, maintained
+    by the scheduler lane on the same completions and page returns the CPU
+    cache sees.  Shadow mode: the kernel does not act on it yet; the runtime
+    can diff it against the CPU cache (``gpu_prefix_check``)."""
 
     use_cutlass_kernel: bool = True
 
@@ -120,6 +128,7 @@ class ModelRunner:
             enable_prefix_cache=config.enable_prefix_cache,
             prefix_cache_pages=config.prefix_cache_pages,
             gen_tail_len=gen_tail_len,
+            gpu_prefix_cache=config.gpu_prefix_cache,
         )
         self.mpk.compile(output_dir=config.output_dir)
 
@@ -222,4 +231,11 @@ class ModelRunner:
             pinned_page_return_tail=torch.zeros(1, dtype=torch.int32).pin_memory(),
             pinned_page_return_head_mirror=torch.zeros(1, dtype=torch.int32).pin_memory(),
             pinned_page_free_count_mirror=torch.zeros(1, dtype=torch.int32).pin_memory(),
+            # GPU prefix index (device memory).  0xFF bytes make every entry's
+            # page_id -1 (empty) even before init_kernel resets the table.
+            gpu_prefix_table=torch.full(
+                (table_bytes(gpu_prefix_table_size(config.max_num_pages),
+                             config.page_size),),
+                255, dtype=torch.uint8, device="cuda"),
+            gpu_prefix_ctl=torch.zeros(PC_CTL_SIZE, dtype=torch.int32, device="cuda"),
         )

@@ -20,6 +20,9 @@
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
+#if defined(MODE_ONLINE_PINNED)
+#include "gpu_prefix_cache.cuh"
+#endif
 #ifdef USE_NVSHMEM
 #include <mpi.h>
 #if defined(MIRAGE_GRACE_BLACKWELL)
@@ -188,10 +191,28 @@ __global__ void init_kernel(RuntimeConfig config) {
     *config.avail_uncommitted = MPK_MAX_NUM_PAGES;
     for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
       config.reserved_remaining[i] = 0;
+      config.gpu_row_num_prefix_pages[i] = 0;
+    }
+    // Counters restart with the kernel; the parameters below PC_CTL_STATS
+    // are Python's and survive a relaunch.
+    for (int i = PC_CTL_TICK; i < PC_CTL_SIZE; i++) {
+      config.gpu_prefix_ctl[i] = 0;
     }
 #endif
 #endif
   }
+#if defined(MODE_ONLINE_PINNED)
+  // The prefix index is large enough to be worth every thread of the block.
+  {
+    PrefixEntry *table = static_cast<PrefixEntry *>(config.gpu_prefix_table);
+    for (int i = threadIdx.x; i < PC_TABLE_SIZE; i += blockDim.x) {
+      table[i].page_id = PC_EMPTY;
+    }
+    for (int i = threadIdx.x; i < MPK_MAX_NUM_PAGES; i += blockDim.x) {
+      config.gpu_prefix_page_slot[i] = -1;
+    }
+  }
+#endif
 }
 
 __global__ void prepare_kernel(RuntimeConfig config,
@@ -513,6 +534,13 @@ __device__ __forceinline__ bool
   int gpu_return_head = *config.gpu_return_head;
   int const ring_mask = MPK_PINNED_RING_CAPACITY - 1;
   int const return_mask = MPK_PAGE_RETURN_RING_CAPACITY - 1;
+  // GPU prefix index (shadow of the CPU cache while it is being brought up).
+  // Everything below is a plain store from the one scheduler lane; nothing
+  // else reads the table during an iteration.
+  PrefixEntry *pc_table = static_cast<PrefixEntry *>(config.gpu_prefix_table);
+  int32_t *pc_ctl = config.gpu_prefix_ctl;
+  bool const pc_enabled = pc_ctl[PC_CTL_ENABLED] != 0;
+  unsigned const pc_tick = static_cast<unsigned>(++pc_ctl[PC_CTL_TICK]);
 
   // Reclaim rows only after the CPU has copied their completed output and
   // release-stored -1 to pinned_step. The owner mapping stays stable for the
@@ -535,8 +563,18 @@ __device__ __forceinline__ bool
     int drained = 0;
     while (gpu_return_head != (int)return_tail &&
            drained < MPK_PAGE_RETURN_DRAIN_LIMIT) {
-      config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] =
+      int page =
           (int)config.pinned_page_return_ring[gpu_return_head & return_mask];
+      if (pc_enabled) {
+        // A returned page is one the CPU cache no longer holds (evicted, or
+        // never cached); the index drops the block it owned, if any.
+        if (pc_erase(pc_table, config.gpu_prefix_page_slot, page)) {
+          pc_ctl[PC_STAT_ERASED]++;
+        } else {
+          pc_ctl[PC_STAT_ERASE_MISS]++;
+        }
+      }
+      config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] = page;
       page_queue_tail++;
       avail_uncommitted++;
       gpu_return_head++;
@@ -607,6 +645,29 @@ __device__ __forceinline__ bool
       }
       st_release_sys_i32(&config.pinned_comp_ready[comp_slot], 1);
       gpu_comp_tail++;
+
+      if (pc_enabled) {
+        // Mirror PrefixCache.insert: index the full pages of the cacheable
+        // prompt range, min(prompt_len, final_kv_len) - gen_tail, continuing
+        // the chain from the pages this row imported. Same inputs as the
+        // CPU's, read from the row instead of a pinned readback.
+        int final_kv_len = step + num_tokens;
+        int cacheable = prompt_len < final_kv_len ? prompt_len : final_kv_len;
+        cacheable -= pc_ctl[PC_CTL_GEN_TAIL];
+        PcInsertResult r = pc_insert_sequence(
+            pc_table,
+            &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+            cacheable,
+            &config.paged_kv_indices_buffer[kv_indptr],
+            config.gpu_row_num_prefix_pages[row],
+            pc_tick,
+            config.gpu_prefix_page_slot);
+        pc_ctl[PC_STAT_COMPLETIONS]++;
+        pc_ctl[PC_STAT_INSERTED] += r.inserted;
+        pc_ctl[PC_STAT_DEDUPED] += r.deduped;
+        pc_ctl[PC_STAT_CHAIN_DROPPED] += r.chain_dropped;
+        pc_ctl[PC_STAT_FULL] += r.full;
+      }
 
       // Retain the row and owner until the CPU acknowledges its completed
       // read through pinned_step[row] = -1.
@@ -723,6 +784,7 @@ __device__ __forceinline__ bool
     // Pop a free buffer row and copy inbox tokens from this ring slot.
     int row = config.free_rows[--free_row_top];
     config.reserved_remaining[row] = worst_need;
+    config.gpu_row_num_prefix_pages[row] = num_prefix_pages;
     int inbox_base = req_slot * MPK_MAX_SEQ_LENGTH;
     for (int j = 0; j < prompt_len; j++) {
       config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
@@ -1593,6 +1655,8 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[28]: pinned_page_return_tail
 // meta_tensors[29]: pinned_page_return_head_mirror
 // meta_tensors[30]: pinned_page_free_count_mirror
+// meta_tensors[31]: gpu_prefix_table (device)
+// meta_tensors[32]: gpu_prefix_ctl (device)
 
 extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
@@ -1622,8 +1686,9 @@ extern "C" void
   // meta_tensors[0..10] are always required.
   // meta_tensors[11..30]: pinned ring pointers (MODE_ONLINE_PINNED only,
   //   passed as CPU-side void* from Python's pinned tensors)
+  // meta_tensors[31..32]: GPU prefix index table and control block (device)
 #if defined(MODE_ONLINE_PINNED)
-  assert(meta_tensors.size() == 31);
+  assert(meta_tensors.size() == 33);
 #else
   assert(meta_tensors.size() == 11);
 #endif
@@ -1685,6 +1750,8 @@ extern "C" void
       static_cast<int32_t volatile *>(meta_tensors[29]);
   global_runtime_config.pinned_page_free_count_mirror =
       static_cast<int32_t volatile *>(meta_tensors[30]);
+  global_runtime_config.gpu_prefix_table = meta_tensors[31];
+  global_runtime_config.gpu_prefix_ctl = static_cast<int32_t *>(meta_tensors[32]);
 #endif
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
@@ -1765,6 +1832,10 @@ extern "C" void
   global_runtime_config.gpu_return_head = gpu_malloc<int>(sizeof(int));
   global_runtime_config.avail_uncommitted = gpu_malloc<int>(sizeof(int));
   global_runtime_config.reserved_remaining =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS);
+  global_runtime_config.gpu_prefix_page_slot =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.gpu_row_num_prefix_pages =
       gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS);
 #endif
 #endif
@@ -2060,7 +2131,9 @@ extern "C" void finalize_persistent_kernel() {
   gpu_free(global_runtime_config.gpu_return_head);
   gpu_free(global_runtime_config.avail_uncommitted);
   gpu_free(global_runtime_config.reserved_remaining);
-  // pinned ring arrays (meta_tensors[11..30]) are Python-owned; do not free.
+  gpu_free(global_runtime_config.gpu_prefix_page_slot);
+  gpu_free(global_runtime_config.gpu_row_num_prefix_pages);
+  // pinned ring arrays (meta_tensors[11..32]) are Python-owned; do not free.
 #endif
 #endif
   int num_workers = global_runtime_config.num_workers;

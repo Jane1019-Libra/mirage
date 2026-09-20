@@ -447,6 +447,15 @@ struct RuntimeConfig {
   int *gpu_return_head;    // private head of the page return ring
   int *avail_uncommitted;  // free pages not promised to an admitted request
   int *reserved_remaining; // [MPK_MAX_NUM_BATCHED_REQUESTS], per buffer row
+  // ── GPU-resident prefix cache (experimental) ─────────────────────────────
+  // Python-owned device memory: the block index and its control/counter
+  // block (gpu_prefix_cache.cuh). Inert unless ctl[PC_CTL_ENABLED] != 0.
+  void *gpu_prefix_table;  // [PC_TABLE_SIZE] PrefixEntry
+  int32_t *gpu_prefix_ctl; // [PC_CTL_SIZE]
+  // GPU-private (gpu_malloc): owner page -> table slot, and the prefix-page
+  // count each row was admitted with (the completion path needs it).
+  int *gpu_prefix_page_slot;       // [MPK_MAX_NUM_PAGES]
+  int *gpu_row_num_prefix_pages;   // [MPK_MAX_NUM_BATCHED_REQUESTS]
 #endif
   void *profiler_buffer;
   bool split_worker_scheduler;

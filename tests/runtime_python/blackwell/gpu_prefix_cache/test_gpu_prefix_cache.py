@@ -4,7 +4,8 @@ Builds the header with 4-token pages and a 64-slot table so every case reads
 by eye, drives the device functions from single-thread kernels (the scheduler
 lane is single-thread too), and checks the CPU PrefixCache's semantics hold:
 full-hit clamp, per-id verification, parent-link verification, dedup,
-chain continuation from an imported prefix, broken-chain guard, table-full.
+chain continuation from an imported prefix, broken-chain guard, table-full,
+and (increment 2) erase-by-page with tombstones that keep probe runs intact.
 
 Run:  python test_gpu_prefix_cache.py      (or pytest)
 """
@@ -29,8 +30,14 @@ __global__ void k_reset(PrefixEntry *t) {
 }
 __global__ void k_insert(PrefixEntry *t, long long const *seq, int seq_len,
                          int const *pages, int num_prefix, unsigned lru,
-                         int *kept, int *out) {
-  if (threadIdx.x == 0) *out = pc_insert_sequence(t, seq, seq_len, pages, num_prefix, lru, kept);
+                         int *page_slot, int *out) {
+  if (threadIdx.x == 0) {
+    PcInsertResult r = pc_insert_sequence(t, seq, seq_len, pages, num_prefix, lru, page_slot);
+    out[0] = r.inserted; out[1] = r.deduped; out[2] = r.chain_dropped; out[3] = r.full;
+  }
+}
+__global__ void k_erase(PrefixEntry *t, int *page_slot, int page, int *out) {
+  if (threadIdx.x == 0) *out = pc_erase(t, page_slot, page);
 }
 __global__ void k_match(PrefixEntry const *t, long long const *prompt, int len,
                         int max_pages, int *pages, int *slots, int *out) {
@@ -43,13 +50,19 @@ torch::Tensor make_table() {
   k_reset<<<1, 128>>>(reinterpret_cast<PrefixEntry *>(t.data_ptr()));
   return t;
 }
-int insert_seq(torch::Tensor t, torch::Tensor seq, torch::Tensor pages, int num_prefix,
-               int lru, torch::Tensor kept) {
-  auto out = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+torch::Tensor insert_seq(torch::Tensor t, torch::Tensor seq, torch::Tensor pages, int num_prefix,
+                         int lru, torch::Tensor page_slot) {
+  auto out = torch::zeros({4}, torch::dtype(torch::kInt32).device(torch::kCUDA));
   k_insert<<<1, 32>>>(reinterpret_cast<PrefixEntry *>(t.data_ptr()),
                       reinterpret_cast<long long const *>(seq.data_ptr<int64_t>()), (int)seq.numel(),
                       pages.data_ptr<int>(), num_prefix, (unsigned)lru,
-                      kept.data_ptr<int>(), out.data_ptr<int>());
+                      page_slot.data_ptr<int>(), out.data_ptr<int>());
+  return out.cpu();
+}
+int erase_page(torch::Tensor t, torch::Tensor page_slot, int page) {
+  auto out = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+  k_erase<<<1, 32>>>(reinterpret_cast<PrefixEntry *>(t.data_ptr()), page_slot.data_ptr<int>(),
+                     page, out.data_ptr<int>());
   return out.item<int>();
 }
 int match(torch::Tensor t, torch::Tensor prompt, int max_pages,
@@ -64,7 +77,8 @@ int match(torch::Tensor t, torch::Tensor prompt, int max_pages,
 
 CPP_SRC = r"""
 torch::Tensor make_table();
-int insert_seq(torch::Tensor, torch::Tensor, torch::Tensor, int, int, torch::Tensor);
+torch::Tensor insert_seq(torch::Tensor, torch::Tensor, torch::Tensor, int, int, torch::Tensor);
+int erase_page(torch::Tensor, torch::Tensor, int);
 int match(torch::Tensor, torch::Tensor, int, torch::Tensor, torch::Tensor);
 """
 
@@ -72,7 +86,7 @@ ext = load_inline(
     name="gpu_prefix_cache_test",
     cpp_sources=CPP_SRC,
     cuda_sources=CUDA_SRC,
-    functions=["make_table", "insert_seq", "match"],
+    functions=["make_table", "insert_seq", "erase_page", "match"],
     extra_include_paths=[INCLUDE],
     extra_cuda_cflags=[f"-DPC_PAGE_SIZE={PS}", f"-DPC_TABLE_SIZE={TABLE}", "-O2"],
     verbose=False,
@@ -83,14 +97,27 @@ I64 = lambda xs: torch.tensor(xs, dtype=torch.int64, device=dev)
 I32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=dev)
 
 
+NUM_PAGES = 4096  # page-id space of the owner map
+
+
 class Cache:
     def __init__(self):
         self.t = ext.make_table()
+        self.page_slot = torch.full((NUM_PAGES,), -1, dtype=torch.int32, device=dev)
 
     def insert(self, seq, pages, num_prefix=0, lru=0):
-        kept = torch.zeros(max(1, len(seq) // PS), dtype=torch.int32, device=dev)
-        n = ext.insert_seq(self.t, I64(seq), I32(pages), num_prefix, lru, kept)
-        return n, kept.tolist()[: len(seq) // PS]
+        """(inserted, kept) where kept[j] says page j now owns a block.
+
+        An imported page (j < num_prefix) owns the block from its own insert,
+        a deduped page owns nothing, so kept reads the owner map.
+        """
+        r = ext.insert_seq(self.t, I64(seq), I32(pages), num_prefix, lru, self.page_slot)
+        self.last = dict(zip(("inserted", "deduped", "chain_dropped", "full"), r.tolist()))
+        owned = self.page_slot[I32(pages).long()].tolist() if pages else []
+        return self.last["inserted"], [int(s >= 0) for s in owned]
+
+    def erase(self, page):
+        return ext.erase_page(self.t, self.page_slot, page)
 
     def match(self, prompt, max_pages=16):
         pages = torch.full((16,), -1, dtype=torch.int32, device=dev)
@@ -136,6 +163,30 @@ def run():
 
     print("broken-chain guard")
     results.append(check("imported block missing -> insert nothing", c.insert([99, 99, 99, 99, 5, 6, 7, 8], [60, 61], num_prefix=1), (0, [0, 0])))
+    results.append(check("  ...and reports chain_dropped", c.last["chain_dropped"], 1))
+
+    print("erase (tombstones)")
+    # Erase D's leaf page 50: match must stop at 3, the page owns nothing.
+    results.append(check("erase leaf page 50 -> 1", c.erase(50), 1))
+    results.append(check("erase again -> 0 (no owner)", c.erase(50), 0))
+    results.append(check("match D+1 after erase -> 3 pages", c.match(D + [17]), (3, [10, 11, 12])))
+    results.append(check("re-insert D tail -> 1 new, slot reused", c.insert(D, [10, 11, 12, 55], num_prefix=3), (1, [1, 1, 1, 1])))
+    results.append(check("match D+1 -> new page 55", c.match(D + [17]), (4, [10, 11, 12, 55])))
+    # Probe-run integrity: fill a small table so runs collide, erase entries in
+    # the middle of runs, and confirm every survivor is still reachable.
+    c3 = Cache()
+    seqs = {k: [2000 + k] * PS for k in range(TABLE - 4)}
+    for k, s in seqs.items():
+        c3.insert(s, [k])
+    for k in range(0, TABLE - 4, 3):
+        c3.erase(k)
+    survivors_ok = all(c3.match(seqs[k] + [0]) == (1, [k]) for k in range(TABLE - 4) if k % 3 != 0)
+    erased_ok = all(c3.match(seqs[k] + [0]) == (0, []) for k in range(0, TABLE - 4, 3))
+    results.append(check("survivors reachable through tombstones", survivors_ok, True))
+    results.append(check("erased blocks miss", erased_ok, True))
+    # Tombstones are reusable capacity: the erased third fits again.
+    refill = sum(c3.insert([3000 + k] * PS, [k])[0] for k in range(0, TABLE - 4, 3))
+    results.append(check("erased slots accept new blocks", refill, len(range(0, TABLE - 4, 3))))
 
     print("table full")
     c2 = Cache()

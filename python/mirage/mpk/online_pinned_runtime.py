@@ -56,6 +56,10 @@ import torch
 
 from .persistent_kernel import max_pages_per_request
 from .prefix_cache import EMPTY_MATCH, Block, PrefixCache, PrefixMatch
+from .gpu_prefix_cache import (
+    PC_CTL_ENABLED, PC_CTL_GEN_TAIL, compare_with_cpu, decode_stats,
+    decode_table,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +91,7 @@ class OnlinePinnedRuntime:
         enable_prefix_cache: bool = False,
         prefix_cache_pages: int = 0,
         gen_tail_len: int = 0,
+        gpu_prefix_cache: bool = False,
     ):
         assert mpk.metadata.mode == "online_pinned", (
             f"OnlinePinnedRuntime requires mode='online_pinned', got {mpk.metadata.mode}"
@@ -176,6 +181,24 @@ class OnlinePinnedRuntime:
         self._gen_tail_len = gen_tail_len
         self._published: Dict[int, _Published] = {}
         self._unadmitted: Deque[_Published] = collections.deque()
+
+        # GPU-resident prefix index (experimental, shadow mode).  The kernel
+        # maintains it from the same completions and page returns the CPU
+        # cache sees; the CPU only switches it on and reads it back.  The
+        # readback buffers are pinned and allocated here, up front: a host
+        # allocation under a running persistent kernel is not something to do
+        # on a debug path.
+        self._gpu_prefix_enabled = bool(gpu_prefix_cache and enable_prefix_cache)
+        self._pc_table = mpk.gpu_prefix_table
+        self._pc_ctl = mpk.gpu_prefix_ctl
+        self._pc_table_host: Optional[torch.Tensor] = None
+        self._pc_ctl_host: Optional[torch.Tensor] = None
+        if self._gpu_prefix_enabled:
+            self._pc_table_host = torch.empty_like(
+                self._pc_table, device="cpu").pin_memory()
+            self._pc_ctl_host = torch.empty_like(
+                self._pc_ctl, device="cpu").pin_memory()
+        self._write_gpu_prefix_params()
 
         # Dedicated stream for HtoD / DtoH copies.
         self._write_stream = torch.cuda.Stream(device=mpk.tokens.device)
@@ -607,6 +630,71 @@ class OnlinePinnedRuntime:
                          for key, value in cache_stats.items())
         return stats
 
+    # ── GPU prefix index (shadow mode) ───────────────────────────────────
+
+    def _write_gpu_prefix_params(self) -> None:
+        """Publish the enable flag and gen-tail length to the control block.
+
+        Called only while the kernel is not running (construction, reset), so
+        the small device writes cannot interleave with the scheduler lane.
+        """
+        if self._pc_ctl is None:
+            return
+        self._pc_ctl[PC_CTL_ENABLED] = 1 if self._gpu_prefix_enabled else 0
+        self._pc_ctl[PC_CTL_GEN_TAIL] = self._gen_tail_len
+
+    @property
+    def gpu_prefix_enabled(self) -> bool:
+        return self._gpu_prefix_enabled
+
+    def _gpu_prefix_readback(self, with_table: bool):
+        """Copy the control block (and optionally the table) to pinned host."""
+        with torch.cuda.stream(self._write_stream):
+            self._pc_ctl_host.copy_(self._pc_ctl, non_blocking=True)
+            if with_table:
+                self._pc_table_host.copy_(self._pc_table, non_blocking=True)
+        self._write_stream.synchronize()
+
+    def gpu_prefix_stats(self) -> Dict[str, int]:
+        """The kernel's counters for its index, as of its last iteration."""
+        if not self._gpu_prefix_enabled:
+            return {"enabled": 0}
+        self._gpu_prefix_readback(with_table=False)
+        return decode_stats(self._pc_ctl_host.numpy())
+
+    def gpu_prefix_check(self, settle: float = 2.0) -> Dict[str, object]:
+        """Diff the GPU index against the CPU cache.
+
+        The two are maintained at different points of a request's life -- the
+        GPU indexes at completion, the CPU when it reaps that completion; the
+        CPU evicts, the GPU erases when the returned page is drained -- so
+        they only agree once nothing is in flight and the return ring is
+        drained.  Waits up to *settle* seconds for that, then snapshots both
+        under ``_owner_lock`` so the CPU side cannot move during the diff.
+        """
+        if not self._gpu_prefix_enabled:
+            return {"enabled": 0}
+        deadline = time.monotonic() + settle
+        while True:
+            with self._owner_lock:
+                with self._admission_lock:
+                    queued = len(self._admission)
+                quiescent = (queued == 0 and not self._published
+                             and self.pending_page_returns == 0)
+                if quiescent or time.monotonic() > deadline:
+                    self._gpu_prefix_readback(with_table=True)
+                    stats = decode_stats(self._pc_ctl_host.numpy())
+                    gpu = decode_table(self._pc_table_host.numpy(),
+                                       self._page_size)
+                    cpu = ({} if self._cache is None
+                           else dict(self._cache._by_page))
+                    break
+            time.sleep(0.01)
+        report = compare_with_cpu(gpu, cpu)
+        report["quiescent"] = quiescent
+        report["gpu_stats"] = stats
+        return report
+
     @property
     def gpu_free_page_count(self) -> int:
         """Free pages the GPU published at the end of its last iteration."""
@@ -790,6 +878,9 @@ class OnlinePinnedRuntime:
                 # the resident pages this hands back are already the GPU's; the
                 # index simply stops claiming them.
                 self._cache.reset()
+            # init_kernel clears the GPU index and its counters on relaunch
+            # but leaves the parameters to us.
+            self._write_gpu_prefix_params()
             self._req_ready.zero_()
             self._req_request_id[:] = 0
             self._req_num_prefix_pages[:] = 0

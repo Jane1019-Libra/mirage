@@ -77,6 +77,8 @@ class MPKMetadata:
     pinned_page_return_tail: Optional[torch.Tensor] = None
     pinned_page_return_head_mirror: Optional[torch.Tensor] = None
     pinned_page_free_count_mirror: Optional[torch.Tensor] = None
+    gpu_prefix_table: Optional[torch.Tensor] = None
+    gpu_prefix_ctl: Optional[torch.Tensor] = None
     # spec decode config
     spec_decode: Optional[str] = None
     spec_decode_config: Optional[object] = None
@@ -228,6 +230,8 @@ class MPK:
         self.pinned_page_return_tail        = args.pinned_page_return_tail
         self.pinned_page_return_head_mirror = args.pinned_page_return_head_mirror
         self.pinned_page_free_count_mirror  = args.pinned_page_free_count_mirror
+        self.gpu_prefix_table               = args.gpu_prefix_table
+        self.gpu_prefix_ctl                 = args.gpu_prefix_ctl
 
         self.profiler_tensor = args.profiler_tensor
         self.spec_decode_config = args.spec_decode_config
@@ -278,6 +282,8 @@ class MPK:
             "pinned_page_return_tail":        args.pinned_page_return_tail,
             "pinned_page_return_head_mirror": args.pinned_page_return_head_mirror,
             "pinned_page_free_count_mirror":  args.pinned_page_free_count_mirror,
+            "gpu_prefix_table":               args.gpu_prefix_table,
+            "gpu_prefix_ctl":                 args.gpu_prefix_ctl,
         }
         self.persistent_kernel = PersistentKernel(
             mode=args.mode,
