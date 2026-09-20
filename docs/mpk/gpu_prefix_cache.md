@@ -111,72 +111,112 @@ reads the result. `MPK_GPU_PREFIX_SERIAL=1` keeps the serial path for an A/B on 
 
 ## 4. Measurements
 
-Qwen3-0.6B, B200, one GPU for every run. Harness: `online_harness.py` (6 cases). Load:
-`bench_serving.py --workload both --groups 4 --prompts-per-group 8 --prefix-tokens 320
---question-tokens 24 --seed 0`, server `--page-size 64 --max-seq-length 1024 --max-num-pages
-128 --max-num-batched-requests 4 --max-num-batched-tokens 8`.
+Everything `oipl_repro.md` §4 and `oipl_benchmarks.md` run for the CPU cache, re-run with the
+kernel owning the cache (`--gpu-prefix-cache`, helper lanes on), OFF and CPU cache alongside as
+controls. Qwen3-0.6B, B200, one uncontended GPU per run, same seed across configurations. Raw
+JSON, server logs and `/debug/prefix_cache` snapshots: `~/oipl/bench/gpc_matrix/`.
 
-### 4.1 Correctness (shadow mode, 64-page pool, harness then a 32-request load with eviction)
+### 4.1 Test pyramid
 
-| Check | Result |
-|---|---|
-| GPU table vs CPU cache after load | 56 blocks each, **0 mismatches** (page ids, token ids, parent links) |
-| Counters | completions 93 = 93, inserted 245 = 245, deduped 5 = 5, evicted 189 = erased 189 |
-| Shadow match vs CPU import, 93 admissions | 136 pages = 136, 0 shorter, 0 longer, 0 page differences |
-| Harness | 6/6 in every mode (cold/warm byte-identical, multi-turn recall) |
+| Layer | Command | Result |
+|---|---|---|
+| L0 | `pytest tests/serving_python/` | **106 passed** |
+| L0 | `oipl_protocol_sim.py --sweep --events 300000 --seeds 2` | all green |
+| L0 | `test_gpu_prefix_cache.py` (device index, 4-token pages) | **38/38 serial, 38/38 warp-cooperative** |
+| L1 | `test_page_geometry` / `test_page_boundary_testmode` / `test_window_skip` (rebuilt: `runtime_header.h` changed) | **3/3**, same numerics (`max diff 7.812e-03`) |
+| L2 | `online_harness.py`, GPU owner mode, `--page-size 64 --max-num-pages 64` | **6 pass / 1 skip**, pages conserved (63 free + 1 cached = 64) |
+| L2 | same, `--max-num-pages 8192` (16 384-slot table) | **6 pass / 1 skip**, 8191 + 1 = 8192 |
+| L2 | same, `--page-size 4096 --max-num-pages 16` | **6 pass / 1 skip**, 16 + 0 = 16 |
 
-### 4.2 Owner mode, structural self-check after load
+Harness detail strings (cold/warm identical, `MK7Q2-31 recalled`, 10/10 isolation) are the ones
+`oipl_repro.md` lists. Page conservation `free + cached (+ pending returns) == total` held at
+every quiesce point of every run below; the owner-mode structural self-check (parent links,
+children counts, no pins while idle) reported 0 errors after every run; 0 admission holds and
+0 fruitless eviction sweeps.
 
-0 dangling parents, 0 wrong children counts, 0 negative refcounts, 0 pins while idle;
-0 admission holds, 0 fruitless sweeps. 136 prefix pages hit on the 64-page run, the same count
-the CPU cache reached on the same workload.
+### 4.2 Shadow-mode equivalence (increments 2 and 3)
 
-### 4.3 Load benchmark
+With both caches on, the GPU table was diffed against the CPU cache after the harness and after
+a 32-request load with eviction: 56 blocks each, **0 mismatches** in page ids, token ids and
+parent links; counters equal (93 completions, 245 inserted, 5 deduped, 189 evicted = erased).
+The GPU's admission-time match agreed with the CPU's import on all 93 requests (136 pages =
+136, 0 shorter, 0 longer, 0 page differences).
 
-Five server configurations, run back to back on one GPU with the same seed. "CPU cache" was
-run twice (`cpu`, `cpu2`) to see the run-to-run spread; "GPU serial" is increment 4 on lane 0
-alone, "GPU warp" is increment 6 with the helper lanes.
+### 4.3 W1 shared prefix (4 groups × 8 prompts, ~320-word prefix, ~24-word questions)
 
-| rate | workload | metric | cache OFF | CPU cache | CPU cache (rerun) | GPU serial | **GPU warp** |
-|---|---|---|---|---|---|---|---|
-| 1.0 | shared_prefix | TTFT p50 | 103.4 ms | 34.5 ms | 35.1 ms | 35.0 ms | **34.2 ms** |
-| 1.0 | shared_prefix | throughput | 0.814 rps | 0.816 rps | 0.816 rps | 0.816 rps | 0.816 rps |
-| 1.0 | random | TTFT p50 | 105.4 ms | 114.7 ms | 115.4 ms | 114.8 ms | 110.9 ms |
-| 24 | shared_prefix | TTFT p50 | 1072.7 ms | 767.8 ms | 782.1 ms | 101.3 ms | **68.2 ms** |
-| 24 | shared_prefix | served throughput | 9.60 rps | 13.81 rps | 13.76 rps | 18.94 rps | **18.98 rps** |
-| 24 | random | TTFT p50 | 1091.3 ms | 1431.1 ms | 1438.9 ms | 1170.8 ms | 1118.8 ms |
-| 24 | random | served throughput | 9.53 rps | 8.17 rps | 8.12 rps | 9.16 rps | 9.37 rps |
+Geometry `--page-size 64 --max-seq-length 1024 --max-num-pages 128`, 4 rows, 8 tokens/batch.
 
-At low load the three caches are indistinguishable: the same −67 % TTFT on shared prefixes.
-At saturation the GPU cache serves **+38 % over the CPU cache** and **+98 % over no cache**,
-with TTFT p50 **11× lower than the CPU cache's** (68 vs 780 ms); 288 prefix pages were hit
-against the CPU's 245 on the same 128 requests, from the admission-time match (§1.1) and the
-whole pool being usable (§1.3). The random control, which shares nothing, is the honest cost
-line: the CPU cache takes 15 % off it at saturation, the GPU cache 1.6 %.
+| rate | metric | cache OFF | CPU cache | **GPU cache** | GPU vs OFF | GPU vs CPU |
+|---|---|---|---|---|---|---|
+| 1 | TTFT p50 | 103.7 ms | 35.5 ms | **35.2 ms** | −66 % | −1 % |
+| 1 | TTFT p95 | 105.9 ms | 103.4 ms | 105.0 ms | (cold leaders) | |
+| 1 | throughput | 0.814 rps | 0.816 rps | 0.816 rps | | |
+| 3 | TTFT p50 | 111.8 ms | 38.4 ms | **37.6 ms** | −66 % | −2 % |
+| 3 | TTFT p95 | 116.5 ms | 117.9 ms | **77.8 ms** | −33 % | −34 % |
+| 12 | TTFT p50 | 305.2 ms | 55.1 ms | **38.4 ms** | −87 % | −30 % |
+| 12 | TTFT p95 | 541.6 ms | 286.9 ms | **139.5 ms** | −74 % | −51 % |
+| 12 | throughput | 9.24 rps | 9.64 rps | 9.65 rps | | |
+| 24 | TTFT p50 | 1111.4 ms | 753.4 ms | **167.0 ms** | −85 % | −78 % |
+| 24 | TTFT p95 | 1711.9 ms | 960.9 ms | **432.9 ms** | −75 % | −55 % |
+| 24 | served throughput | 9.40 rps | 13.98 rps | **18.93 rps** | **+101 %** | **+35 %** |
 
-The two CPU-cache runs agree to 0.4 %, so the spread within this session is small. The same
-configuration measured 18.2 rps in `oipl_polish.md` on an earlier day; treat cross-session
-absolute values with care and same-session ordering as reliable.
+`oipl_benchmarks.md` reported −65.7 % TTFT p50 at 1 rps and +78 % throughput at 24 rps for the
+CPU cache; the CPU-cache column here reproduces the first (−66 %) and lands lower on the second
+(+49 %) — two runs in this session agree to 0.4 %, so this is a day-to-day difference of the
+box, not noise within the grid. The GPU column is measured against the same OFF baseline in the
+same session.
 
-### 4.4 Cost on the scheduler lane
+Why the GPU cache pulls ahead as load rises: at 12 rps the CPU cache hit 103 of 256 publishes
+and imported 515 pages; the GPU matched at admission and imported 578 (the leader's pages are
+already indexed by the time a follower is admitted), and cached pages are pool slack (118 of
+128 resident vs the CPU's fixed 112), so no request waited for a page.
 
-Measured by `%globaltimer` around each operation, 128-page pool, prompts of ~6 pages
-(`/debug/prefix_cache` after the rate-24 run):
+### 4.4 W2 random control (32 distinct ~360-word prompts, nothing shared)
+
+| rate | metric | cache OFF | CPU cache | **GPU cache** |
+|---|---|---|---|---|
+| 1 | TTFT p50 | 107.5 ms | 115.0 ms | 115.7 ms |
+| 3 | TTFT p50 | 112.8 ms | 115.9 ms | 117.0 ms |
+| 12 | throughput | 9.18 rps | 8.07 rps (−12 %) | **9.09 rps (−1 %)** |
+| 12 | TTFT p50 | 325.7 ms | 608.0 ms | **338.8 ms** |
+| 24 | throughput | 9.33 rps | 8.12 rps (−13 %) | **9.16 rps (−2 %)** |
+| 24 | TTFT p50 | 1133.3 ms | 1432.2 ms | **1160.3 ms** |
+
+At low rate both caches cost the control ~7 % TTFT (the chat-template header is a one-page hit
+that changes `initial_step`; `oipl_benchmarks.md` saw ±2 % on a different day). Under load the
+CPU cache's staging/eviction work costs 12–13 % throughput on traffic that cannot benefit; the
+GPU cache costs 1–2 %.
+
+### 4.5 Long prompts (geometry 2048 / 256 pages, ~1200-word shared prefix ≈ 25 pages)
+
+The case the serial-lane cost argument was about.
+
+| rate | workload | metric | CPU cache | **GPU cache** |
+|---|---|---|---|---|
+| 1 | shared_prefix | TTFT p50 | 48.2 ms | 47.6 ms |
+| 1 | random | TTFT p50 | 413.4 ms | 410.5 ms |
+| 24 | shared_prefix | served throughput | 4.90 rps | **8.93 rps (+82 %)** |
+| 24 | shared_prefix | TTFT p50 | 3926 ms | **2077 ms** |
+| 24 | random | served throughput | 2.41 rps | 2.47 rps |
+
+GPU-side cost per request at this prompt length (31 helper lanes): match 30 µs, completion
+insert 86 µs, eviction 5 µs per block; 1058 pages imported over 128 requests against the
+CPU's 904.
+
+### 4.6 Cost on the scheduler lane, serial vs helper lanes
+
+128-page geometry, prompts of ~6 pages, `%globaltimer` around each operation:
 
 | operation | serial lane 0 | 31 helper lanes | speed-up |
 |---|---|---|---|
-| match (Step 4, per admission) | 37.6 µs | 10.8 µs | 3.5× |
-| completion insert (Step 1) | 87.7 µs | 23.2 µs | 3.8× |
+| match (Step 4, per admission) | 37.6 µs | 12.1 µs | 3.1× |
+| completion insert (Step 1) | 87.7 µs | 25.7 µs | 3.4× |
 | eviction (per block) | 27.9 µs | 4.5 µs | 6.2× |
 
-The 64-page harness run (sparser table) gave 22 / 57 / 44 µs serial and 7.6 / 16 / 5.1 µs
-with helpers. The remaining cost is dominated by the dependent chain of block lookups (one
-probe per block, each a global-memory round trip); it grows linearly with pages per request
-and is paid on the barrier between iterations, so for long prompts it is still worth watching
-(§5). The 64-id hash and compare, which were the serial version's inner loop, are now one
-reduction and one ballot each.
-
----
+The remaining cost is the dependent chain of one probe per block (a global-memory round trip
+each); it grows linearly with pages per request (§4.5: 30 / 86 µs at ~25 pages) and is paid on
+the barrier between iterations. The 64-id hash and compare, the serial version's inner loop, are
+one reduction and one ballot each.
 
 ## 5. What is not done
 
@@ -193,6 +233,9 @@ reduction and one ballot each.
   would cut it; not done.
 - Only a single scheduler warp's helpers ever do work (the one whose lane 0 reaches the
   end-of-graph event); the helpers of the other scheduler warps idle at `__nanosleep`.
+- A persistent kernel sharing its GPU with another tenant's job can stall (all blocks must be
+  co-resident). One L2 run hung and one OOM'd while a 152 GB job sat on the same GPU; both
+  passed on a free GPU. Not a cache issue, but the reason every number above names one GPU.
 - The protocol simulator (`oipl_protocol_sim.py`) models the CPU-owned lifecycle; owner mode has
   no equivalent model yet, only the structural self-check at `/debug/prefix_cache`.
 
