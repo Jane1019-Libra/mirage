@@ -84,24 +84,39 @@ async def _stream_bridge(tokens, tokenizer):
     """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
+    # Set when the consumer goes away -- a client that disconnects mid-stream
+    # cancels the SSE task, which closes this generator.
+    stop = threading.Event()
 
     def run():
         try:
             for item in _decode_output(tokens, tokenizer):
+                if stop.is_set():
+                    break
                 loop.call_soon_threadsafe(queue.put_nowait, item)
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
+            # Close the engine stream on the thread that iterates it.  An
+            # engine stream closed before its final token cancels the request
+            # (the streaming monitor abandons it and releases its row when the
+            # kernel finishes), instead of decoding it for nobody.
+            close = getattr(tokens, "close", None)
+            if close is not None:
+                close()
             loop.call_soon_threadsafe(queue.put_nowait, None)
 
     threading.Thread(target=run, daemon=True).start()
-    while True:
-        item = await queue.get()
-        if item is None:
-            break
-        if isinstance(item, Exception):
-            raise item
-        yield item
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        stop.set()
 
 
 async def _completion_response(req, chat, model, prompt_tokens, tokens, tokenizer):
@@ -201,10 +216,13 @@ async def debug_prefix_cache(settle: float = 2.0):
               # Page conservation at quiesce: free + cached (+ pending
               # returns, CPU mode) must equal the pool.
               "pages": {"total": runtime.max_num_pages,
+                        "page_size": runtime.page_size,
                         "gpu_free": runtime.gpu_free_page_count,
                         "pending_returns": runtime.pending_page_returns}}
     if runtime.gpu_prefix_enabled:
         report["gpu"] = await asyncio.to_thread(runtime.gpu_prefix_check, settle)
+        # Taken once the engine is idle, together with the index snapshot.
+        report["pages"] = report["gpu"].pop("pages", report["pages"])
     return report
 @app.get("/health")
 async def health():

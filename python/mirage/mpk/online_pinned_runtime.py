@@ -713,6 +713,10 @@ class OnlinePinnedRuntime:
         return self._max_num_pages
 
     @property
+    def page_size(self) -> int:
+        return self._page_size
+
+    @property
     def gpu_prefix_mode(self) -> str:
         return {PC_MODE_OFF: "off", PC_MODE_SHADOW: "shadow",
                 PC_MODE_OWNER: "owner"}[self._gpu_prefix_mode]
@@ -755,6 +759,13 @@ class OnlinePinnedRuntime:
                 quiescent = (queued == 0 and not self._published
                              and self.pending_page_returns == 0)
                 if quiescent or time.monotonic() > deadline:
+                    # Page counters from the same moment as the table, so a
+                    # caller checking conservation never mixes a mid-flight
+                    # free count with an idle index.
+                    pages = {"total": self._max_num_pages,
+                             "page_size": self._page_size,
+                             "gpu_free": self.gpu_free_page_count,
+                             "pending_returns": self.pending_page_returns}
                     self._gpu_prefix_readback(with_table=True)
                     stats = decode_stats(self._pc_ctl_host.numpy())
                     gpu = decode_table(self._pc_table_host.numpy(),
@@ -769,6 +780,7 @@ class OnlinePinnedRuntime:
             report = compare_with_cpu(gpu, cpu)
         report["mode"] = self.gpu_prefix_mode
         report["quiescent"] = quiescent
+        report["pages"] = pages
         report["gpu_stats"] = stats
         return report
 
@@ -939,6 +951,8 @@ class OnlinePinnedRuntime:
     def abandon_request(self, rid: int) -> None:
         """Release *rid* when it completes without retaining its output."""
         with self._lock:
+            # Streams cancelled by a disconnecting client, timeouts, errors.
+            self._page_stats["abandoned_requests"] += 1
             completion = self._completions.get(rid)
             if completion is None:
                 self._abandoned.add(rid)
