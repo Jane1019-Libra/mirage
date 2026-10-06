@@ -222,6 +222,14 @@ class OnlinePinnedRuntime:
 
         # Dedicated stream for HtoD / DtoH copies.
         self._write_stream = torch.cuda.Stream(device=mpk.tokens.device)
+        # Staging for read_token_ranges.  Allocated here, before the kernel is
+        # launched: a pinned (or device) allocation while the persistent kernel
+        # runs can stall behind it -- the .clone() readback hang -- and the
+        # streaming monitor reads every 0.2 ms.  One row's worth per row
+        # bounds a poll, since each stream reads only inside its own row.
+        self._range_host = torch.empty(
+            mpk.tokens.numel(), dtype=mpk.tokens.dtype).pin_memory()
+        self._range_lock = threading.Lock()
 
         # Serialises one owner tick against another.  The owner thread is
         # normally the only ticker, but a driver running without one polls
@@ -857,26 +865,49 @@ class OnlinePinnedRuntime:
         lengths = [end - start + 1 for _row, start, end in ranges]
         if any(length <= 0 for length in lengths):
             raise ValueError("token ranges must be non-empty and inclusive")
-        host_tokens = torch.empty(
-            sum(lengths),
-            dtype=self._mpk.tokens.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-        offset = 0
-        with torch.cuda.stream(self._write_stream):
-            for (row, start, end), length in zip(ranges, lengths):
-                host_tokens[offset : offset + length].copy_(
-                    self._mpk.tokens[row, start : end + 1],
-                    non_blocking=True,
-                )
-                offset += length
-        self._write_stream.synchronize()
+        capacity = self._range_host.numel()
         results: List[torch.Tensor] = []
-        offset = 0
-        for length in lengths:
-            results.append(host_tokens[offset : offset + length])
-            offset += length
+        # Batches that fit the preallocated staging buffer share one sync; a
+        # caller asking for more than it holds is served in several batches.
+        batch: List[Tuple[int, int, int, int]] = []
+        used = 0
+        for (row, start, end), length in zip(ranges, lengths):
+            if length > capacity:
+                raise ValueError("token range exceeds the token buffer")
+            if used + length > capacity:
+                results.extend(self._read_staged(batch))
+                batch, used = [], 0
+            batch.append((row, start, end, length))
+            used += length
+        results.extend(self._read_staged(batch))
+        return results
+
+    def _read_staged(
+        self, batch: Sequence[Tuple[int, int, int, int]]
+    ) -> List[torch.Tensor]:
+        """Copy *batch* through the pinned staging buffer, one sync total.
+
+        The returned tensors are CPU copies, so they stay valid after the next
+        read reuses the staging buffer.
+        """
+        if not batch:
+            return []
+        with self._range_lock:
+            host = self._range_host
+            offset = 0
+            with torch.cuda.stream(self._write_stream):
+                for row, start, end, length in batch:
+                    host[offset : offset + length].copy_(
+                        self._mpk.tokens[row, start : end + 1],
+                        non_blocking=True,
+                    )
+                    offset += length
+            self._write_stream.synchronize()
+            results: List[torch.Tensor] = []
+            offset = 0
+            for _row, _start, _end, length in batch:
+                results.append(host[offset : offset + length].clone())
+                offset += length
         return results
 
     def finish_reason(self, row: int) -> str:

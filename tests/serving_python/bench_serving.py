@@ -10,11 +10,13 @@ reused by ``--prompts-per-group`` distinct short questions.  No sglang code is
 vendored; this is a standard-library re-implementation shaped to our engine.
 
 Where it deliberately differs, and why
-    *No sampling parameters.*  Our engine has no ``max_tokens``: generation
-    runs to EOS or ``--max-seq-length``.  Output length is bounded by the
-    prompt instead -- short-answer questions plus Qwen3's ``/no_think`` soft
-    switch -- so ``--prefix-tokens``/``--question-tokens`` shape the input and
-    nothing pins the output.
+    *Greedy, no output cap by default.*  Requests carry ``temperature 0`` and
+    no ``max_tokens``, so generation runs to EOS or ``--max-seq-length`` as it
+    did before the engine had per-request sampling, and runs stay comparable
+    across versions.  Output length is bounded by the prompt instead --
+    short-answer questions plus Qwen3's ``/no_think`` soft switch -- so
+    ``--prefix-tokens``/``--question-tokens`` shape the input.
+    ``--max-tokens`` / ``--temperature`` override that.
     *Tiny request rates.*  Prefill advances 8 tokens per iteration
     (``--max-num-batched-tokens 8``), so a rate sglang would call idle already
     saturates us.  0.5-4 rps is the useful band.
@@ -382,8 +384,11 @@ def run_workload(args, workload: str) -> dict:
 
     def worker(prompt: Prompt) -> None:
         result = Result(index=prompt.index, group=prompt.group)
-        payload = {"messages": prompt.messages(args.prompt_suffix),
+        payload = {"model": args.model, "temperature": args.temperature,
+                   "messages": prompt.messages(args.prompt_suffix),
                    "stream": True}
+        if args.max_tokens:
+            payload["max_tokens"] = args.max_tokens
         try:
             stream_one(args.host, args.port, payload, args.request_timeout,
                        result)
@@ -495,6 +500,12 @@ def extract_summary(stdout: str) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="sglang-methodology serving benchmark for the MPK server.")
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B",
+                        help="served model name sent in every request")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="per-request temperature (default greedy)")
+    parser.add_argument("--max-tokens", type=int, default=0,
+                        help="per-request output cap (0: none)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--attach-port", type=int, required=True,
                         help="port of a server the runner already launched; "

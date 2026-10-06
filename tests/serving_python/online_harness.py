@@ -183,8 +183,17 @@ def post_sse(host: str, port: int, path: str, payload: dict,
     return cap
 
 
+# Fields every request carries.  The OpenAI layer requires ``model`` to name
+# the served model and defaults ``temperature`` to 1.0 as the API does; these
+# cases compare text (coldwarm, isolation markers, multiturn recall), so they
+# ask for greedy decoding explicitly.  ``main`` fills in the model name.
+# Servers that predate per-request sampling ignore both fields.
+REQUEST_DEFAULTS: dict = {"temperature": 0}
+
+
 def chat_payload(prompt: str, stream: bool = False) -> dict:
     return {
+        **REQUEST_DEFAULTS,
         "messages": [{"role": "user", "content": prompt}],
         "stream": stream,
     }
@@ -210,7 +219,8 @@ def one_chat(ctx: "Context", messages: list[dict], what: str) -> str:
     """Non-stream chat over a whole messages list; fails closed on anything else."""
     try:
         status, body = post_json(ctx.host, ctx.port, CHAT_PATH,
-                                 {"messages": messages, "stream": False},
+                                 {**REQUEST_DEFAULTS, "messages": messages,
+                                  "stream": False},
                                  ctx.request_timeout)
     except (socket.timeout, TimeoutError):
         raise CaseFailure(
@@ -611,6 +621,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Online-serving harness for the MPK HTTP server.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--served-model-name", default=None,
+                        help="model name to put in requests (default: --model)")
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0,
@@ -646,6 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    REQUEST_DEFAULTS["model"] = args.served_model_name or args.model
     selected = select_cases(args.cases)
 
     attach = args.attach_port is not None

@@ -31,6 +31,10 @@ def _load_llm_engine():
     tokenizer_manager.TokenizerManager = object
     sys.modules[tokenizer_manager.__name__] = tokenizer_manager
 
+    sampling = types.ModuleType(f"{package}.engine.sampling")
+    sampling.SamplingParams = object
+    sys.modules[sampling.__name__] = sampling
+
     runtime = types.ModuleType(f"{package}.mpk.online_pinned_runtime")
     runtime.OnlinePinnedRuntime = object
     sys.modules[runtime.__name__] = runtime
