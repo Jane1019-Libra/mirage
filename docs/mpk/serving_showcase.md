@@ -84,6 +84,39 @@ Same geometry and workload as `gpu_prefix_cache.md` §4.3 (1024 tokens, 128 page
 - At 24 rps the GPU cache serves +87% over no cache and +24% over the CPU cache, with TTFT p50 9× lower than the CPU cache's.
 - The baselines moved too (OFF +8%, CPU cache +9% at 24 rps). That comes from the code merged underneath, most likely upstream's scheduler packing (#775) and #2's faster monitor. These runs do not isolate the cause, so the GPU-vs-CPU gap is quoted against the CPU cache measured on this branch (+24%), not against the earlier +35%.
 
+### Full matrix on the merged stack
+
+Every rate the earlier cache matrix ran, measured on this branch (2026-10-06). TTFT is p50 / p95 in ms; throughput in requests per second. Every run completed 32/32 requests with 0 failures.
+
+**Shared prefix, 1,024 tokens, 128 pages**
+
+| rate | no cache: rps, TTFT | CPU cache: rps, TTFT | GPU cache: rps, TTFT |
+|---|---|---|---|
+| 1 | 0.81, 100.9 / 102.6 | 0.82, 33.0 / 101.8 | 0.82, **32.8** / 102.3 |
+| 3 | 2.43, 100.3 / 114.0 | 2.44, 31.9 / 102.0 | 2.44, **31.6** / 101.9 |
+| 12 | 9.35, 231.5 / 429.6 | 9.66, 35.2 / 241.8 | 9.66, **33.1 / 116.4** |
+| 24 | 10.19, 965 / 1467 | 15.29, 584 / 812 | **19.02, 62 / 198** |
+
+**Random control (nothing shared), same geometry**
+
+| rate | no cache | CPU cache | GPU cache |
+|---|---|---|---|
+| 12 | 9.35 rps, 231.6 ms | 8.92 rps, 370.8 ms | 9.36 rps, 218.6 ms |
+| 24 | 10.14 rps, 980 ms | 8.96 rps, 1229 ms | 10.25 rps, 961 ms |
+
+At 1 and 3 rps all three are within 1 ms of each other on this workload.
+
+**Long prompts: 2,048 tokens, 256 pages, ~1,200-word shared prefix (about 25 pages)**
+
+| rate | load | no cache | CPU cache | GPU cache |
+|---|---|---|---|---|
+| 1 | shared prefix, TTFT p50 | 375.9 ms | 45.5 ms | **45.2 ms** |
+| 24 | shared prefix, throughput | 2.66 rps | 6.27 rps | **9.50 rps** |
+| 24 | shared prefix, TTFT p50 | 5583 ms | 3541 ms | **1870 ms** |
+| 24 | random, throughput | 2.66 rps | 2.59 rps | 2.65 rps |
+
+With long shared prefixes the GPU cache serves 3.6× the no-cache throughput and 1.5× the CPU cache's at 24 rps. Over the long-prompt server's lifetime the GPU cache imported 1,058 prefix pages to the CPU cache's 960, held 0 admissions (CPU: 1), and its work on the scheduler lane cost 27.8 µs per match, 83.0 µs per completion insert and 4.9 µs per evicted block.
+
 ---
 
 ## 4. Validation on the merged stack
