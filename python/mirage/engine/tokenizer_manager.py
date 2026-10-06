@@ -111,6 +111,14 @@ class TokenizerManager:
         with self._lock:
             return self._tokenizer.decode([token_id], skip_special_tokens=True)
 
+    def decode_each(self, token_ids: Sequence[int]) -> list[str]:
+        """Decode several token IDs while acquiring the tokenizer lock once."""
+        with self._lock:
+            return [
+                self._tokenizer.decode([token_id], skip_special_tokens=True)
+                for token_id in token_ids
+            ]
+
     def _encode(self, text: str) -> list[int]:
         with self._lock:
             return self._tokenizer([text], return_tensors="pt").input_ids[0].tolist()

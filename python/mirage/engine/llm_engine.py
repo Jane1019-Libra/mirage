@@ -30,6 +30,7 @@ class _StreamingMonitor:
         self._sessions: dict[int, dict] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -43,7 +44,9 @@ class _StreamingMonitor:
                 'row': -1,
                 'last_step': prompt_len - 1,
                 'deadline': time.monotonic() + timeout,
+                'cancelled': False,
             }
+        self._wake.set()
         return q
 
     def unregister(self, rid: int) -> None:
@@ -51,86 +54,156 @@ class _StreamingMonitor:
         with self._lock:
             self._sessions.pop(rid, None)
 
+    def cancel(self, rid: int) -> None:
+        """Ask the monitor to abandon a stream its consumer stopped reading."""
+        with self._lock:
+            session = self._sessions.get(rid)
+            if session is not None:
+                # The monitor owns row reads and releases.  Marking instead of
+                # abandoning here prevents a row from being reused during a
+                # D2H copy already scheduled by the monitor.
+                session['cancelled'] = True
+        self._wake.set()
+
+    def _is_active(self, rid: int, session: dict) -> bool:
+        with self._lock:
+            return self._sessions.get(rid) is session
+
+    def _remove(self, rid: int, session: dict) -> None:
+        with self._lock:
+            if self._sessions.get(rid) is session:
+                del self._sessions[rid]
+
+    def _fail(self, rid: int, session: dict, marker: str) -> None:
+        """Abandon one request, wake its consumer, and forget the session."""
+        try:
+            self._runtime.abandon_request(rid)
+        except Exception:
+            # The consumer still has to be woken even if runtime cleanup has
+            # already failed.  The runtime exposes that failure on later calls.
+            pass
+        finally:
+            if self._is_active(rid, session):
+                session['q'].put((marker, True))
+                self._remove(rid, session)
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            self._wake.clear()
+            sessions: list[tuple[int, dict]] = []
+            has_active_row = False
             try:
                 with self._lock:
-                    for rid, s in list(self._sessions.items()):
-                        released = False
-                        try:
-                            # Completion is authoritative and may arrive before
-                            # the monitor observes the transient row mapping.
-                            completion = self._runtime.get_completion(rid)
-                            if completion is not None:
-                                row, final_step = completion
-                                try:
-                                    self._yield_remaining(s, row, final_step)
-                                finally:
-                                    released = self._runtime.release_request(rid)
-                                if not released:
+                    sessions = list(self._sessions.items())
+
+                # (rid, session, row, start, end, completed)
+                pending_reads: list[tuple[int, dict, int, int, int, bool]] = []
+                now = time.monotonic()
+
+                for rid, s in sessions:
+                    if not self._is_active(rid, s):
+                        continue
+                    try:
+                        if s['cancelled']:
+                            self._runtime.abandon_request(rid)
+                            self._remove(rid, s)
+                            continue
+
+                        # Completion is authoritative and may arrive before
+                        # the monitor observes the transient row mapping.
+                        completion = self._runtime.get_completion(rid)
+                        if completion is not None:
+                            row, final_step = completion
+                            if final_step > s['last_step']:
+                                pending_reads.append((
+                                    rid, s, row, s['last_step'] + 1,
+                                    final_step, True))
+                            else:
+                                if not self._runtime.release_request(rid):
                                     raise RuntimeError(
                                         f"missing completion for rid={rid}")
-                                del self._sessions[rid]
+                                s['q'].put(("", True))
+                                self._remove(rid, s)
+                            continue
+
+                        if now > s['deadline']:
+                            self._fail(rid, s, "__timeout__")
+                            continue
+
+                        # Phase 1 — discover buffer row.
+                        if s['row'] == -1:
+                            row = self._runtime.find_row_for_rid(rid)
+                            if row >= 0:
+                                s['row'] = row
+                                has_active_row = True
+                            continue
+
+                        # Phase 2 — record the new range.  All recorded ranges
+                        # are copied below and share one CUDA synchronization.
+                        row = s['row']
+                        has_active_row = True
+                        current_step = self._runtime.get_current_step_at_row(row)
+                        if current_step > s['last_step']:
+                            pending_reads.append((
+                                rid, s, row, s['last_step'] + 1,
+                                current_step, False))
+                    except Exception:
+                        self._fail(rid, s, "__error__")
+
+                if pending_reads:
+                    ranges = [(row, start, end) for (
+                        _rid, _s, row, start, end, _done) in pending_reads]
+                    try:
+                        token_batches = self._runtime.read_token_ranges(ranges)
+                    except Exception:
+                        for rid, s, *_rest in pending_reads:
+                            self._fail(rid, s, "__error__")
+                    else:
+                        for pending, tokens in zip(pending_reads, token_batches):
+                            rid, s, _row, _start, _end, completed = pending
+                            if not self._is_active(rid, s):
                                 continue
-
-                            # Phase 1 — discover buffer row.
-                            if s['row'] == -1:
-                                row = self._runtime.find_row_for_rid(rid)
-                                if row >= 0:
-                                    s['row'] = row
-                                elif time.monotonic() > s['deadline']:
-                                    self._runtime.abandon_request(rid)
-                                    s['q'].put(("__timeout__", True))
-                                    del self._sessions[rid]
-                                continue
-
-                            row = s['row']
-
-                            # Phase 2 — poll step progress, read only new tokens.
-                            current_step = self._runtime.get_current_step_at_row(row)
-                            if current_step > s['last_step']:
-                                new_tokens = self._runtime.read_tokens_range(
-                                    row, s['last_step'] + 1, current_step)
-                                for tid in new_tokens.tolist():
-                                    text = self._tokenizer_manager.decode_single(tid)
-                                    s['last_step'] += 1
-                                    s['q'].put((text, False))
-
-                            # Check timeout.
-                            if time.monotonic() > s['deadline']:
+                            if s['cancelled']:
                                 self._runtime.abandon_request(rid)
-                                s['q'].put(("__timeout__", True))
-                                del self._sessions[rid]
-
-                        except Exception:
+                                self._remove(rid, s)
+                                continue
+                            released = False
                             try:
-                                if not released:
-                                    self._runtime.abandon_request(rid)
-                            finally:
-                                s['q'].put(("__error__", True))
-                                del self._sessions[rid]
+                                token_ids = tokens.tolist()
+                                texts = self._tokenizer_manager.decode_each(token_ids)
+                                if completed:
+                                    released = self._runtime.release_request(rid)
+                                    if not released:
+                                        raise RuntimeError(
+                                            f"missing completion for rid={rid}")
+                                for index, text in enumerate(texts):
+                                    s['last_step'] += 1
+                                    is_final = completed and index == len(texts) - 1
+                                    s['q'].put((text, is_final))
+                                if completed:
+                                    self._remove(rid, s)
+                            except Exception:
+                                if released:
+                                    s['q'].put(("__error__", True))
+                                    self._remove(rid, s)
+                                else:
+                                    self._fail(rid, s, "__error__")
 
             except Exception:
                 pass
 
-            self._stop.wait(0.002)  # 2 ms polling interval
-
-    def _yield_remaining(self, s: dict, row: int, final_step: int) -> None:
-        """Yield all remaining tokens for a completed request."""
-        if final_step > s['last_step']:
-            new_tokens = self._runtime.read_tokens_range(
-                row, s['last_step'] + 1, final_step)
-            new_ids = new_tokens.tolist()
-            for j, tid in enumerate(new_ids):
-                text = self._tokenizer_manager.decode_single(tid)
-                is_final = (j == len(new_ids) - 1)
-                s['q'].put((text, is_final))
-                s['last_step'] += 1
-        else:
-            s['q'].put(("", True))
+            if sessions:
+                # Match the runtime owner cadence once a row is active.  A
+                # request still waiting for admission needs less aggressive
+                # polling, which keeps the latency win without burning a CPU.
+                self._stop.wait(0.0002 if has_active_row else 0.001)
+            else:
+                # No streams: sleep until register() or shutdown() wakes us.
+                self._wake.wait()
 
     def shutdown(self) -> None:
         self._stop.set()
+        self._wake.set()
         self._thread.join()
         with self._lock:
             sessions = list(self._sessions.items())
@@ -292,23 +365,29 @@ class LLMEngine:
         threads stays constant regardless of concurrent request count.
         """
         def generator():
-            while True:
-                try:
-                    text, is_final = q.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if text == "__timeout__":
-                    raise TimeoutError(
-                        f"stream timed out for rid={rid}")
-                if text == "__error__":
-                    raise RuntimeError(
-                        f"stream error for rid={rid}")
-                if text == "__closed__":
-                    raise RuntimeError(
-                        f"engine closed while streaming rid={rid}")
-                yield (text, is_final)
-                if is_final:
-                    break
+            finished = False
+            try:
+                while True:
+                    try:
+                        text, is_final = q.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if text == "__timeout__":
+                        raise TimeoutError(
+                            f"stream timed out for rid={rid}")
+                    if text == "__error__":
+                        raise RuntimeError(
+                            f"stream error for rid={rid}")
+                    if text == "__closed__":
+                        raise RuntimeError(
+                            f"engine closed while streaming rid={rid}")
+                    yield (text, is_final)
+                    if is_final:
+                        finished = True
+                        break
+            finally:
+                if not finished:
+                    self._monitor.cancel(rid)
 
         return generator()
 

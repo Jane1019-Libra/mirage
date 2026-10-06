@@ -804,10 +804,43 @@ class OnlinePinnedRuntime:
 
     def read_tokens_range(self, buffer_row: int, start: int, end: int) -> torch.Tensor:
         """Read tokens [start..end] (inclusive) from *buffer_row*."""
+        return self.read_token_ranges([(buffer_row, start, end)])[0]
+
+    def read_token_ranges(
+        self, ranges: Sequence[Tuple[int, int, int]]
+    ) -> List[torch.Tensor]:
+        """Read several inclusive token ranges with one CUDA synchronization.
+
+        The streaming monitor polls every active request together.  Enqueueing
+        all D2H copies on the runtime's copy stream before synchronizing avoids
+        paying one host-side CUDA synchronization per active request.
+        """
+        if not ranges:
+            return []
+        lengths = [end - start + 1 for _row, start, end in ranges]
+        if any(length <= 0 for length in lengths):
+            raise ValueError("token ranges must be non-empty and inclusive")
+        host_tokens = torch.empty(
+            sum(lengths),
+            dtype=self._mpk.tokens.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        offset = 0
         with torch.cuda.stream(self._write_stream):
-            result = self._mpk.tokens[buffer_row, start : end + 1].clone()
+            for (row, start, end), length in zip(ranges, lengths):
+                host_tokens[offset : offset + length].copy_(
+                    self._mpk.tokens[row, start : end + 1],
+                    non_blocking=True,
+                )
+                offset += length
         self._write_stream.synchronize()
-        return result
+        results: List[torch.Tensor] = []
+        offset = 0
+        for length in lengths:
+            results.append(host_tokens[offset : offset + length])
+            offset += length
+        return results
 
     def get_completion(self, rid: int) -> Tuple[int, int] | None:
         """Return the completion for *rid*, if the GPU has published it."""
