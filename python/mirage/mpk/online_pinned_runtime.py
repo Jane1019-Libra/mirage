@@ -687,6 +687,41 @@ class OnlinePinnedRuntime:
                          for key, value in cache_stats.items())
         return stats
 
+    def idle_snapshot(self, settle: float = 2.0) -> Dict[str, object]:
+        """Counters and page accounting once the engine is idle, in any cache mode.
+
+        Waits up to *settle* seconds for nothing to be queued, published or
+        still in the page-return ring, then reads the counters and the page
+        mirrors in one step under ``_owner_lock``, so a caller checking page
+        conservation never mixes a mid-flight free count with an idle cache.
+        ``quiescent`` says whether the wait succeeded.
+        """
+        deadline = time.monotonic() + settle
+        while True:
+            with self._owner_lock:
+                with self._admission_lock:
+                    queued = len(self._admission)
+                quiescent = (queued == 0 and not self._published
+                             and self.pending_page_returns == 0)
+                if quiescent or time.monotonic() > deadline:
+                    pages = {"total": self._max_num_pages,
+                             "page_size": self._page_size,
+                             "gpu_free": self.gpu_free_page_count,
+                             "pending_returns": self.pending_page_returns}
+                    # Same order as the owner tick: _owner_lock, then _lock.
+                    with self._lock:
+                        stats = dict(self._page_stats)
+                    stats["published_unadmitted"] = len(self._unadmitted)
+                    cache_stats = None if self._cache is None else self._cache.stats()
+                    break
+            time.sleep(0.01)
+        stats["cache_enabled"] = int(cache_stats is not None)
+        if cache_stats is not None:
+            stats["cache_capacity_pages"] = self._cache.capacity_pages
+            stats.update(("cache_" + key, value)
+                         for key, value in cache_stats.items())
+        return {"quiescent": quiescent, "cpu": stats, "pages": pages}
+
     # ── GPU prefix index (shadow mode) ───────────────────────────────────
 
     def _write_gpu_prefix_params(self) -> None:

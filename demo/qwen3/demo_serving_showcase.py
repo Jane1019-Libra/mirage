@@ -237,6 +237,23 @@ def matched_pages(report: dict | None) -> int:
     return int((report.get("cpu") or {}).get("imported_pages", 0))
 
 
+def counter(report: dict | None, gpu_key: str, cpu_key: str) -> int:
+    """A cache counter from whichever side owns the cache on this server."""
+    if not report:
+        return 0
+    if report.get("gpu_mode") == "owner":
+        return int(gpu_stats(report).get(gpu_key) or 0)
+    return int((report.get("cpu") or {}).get(cpu_key) or 0)
+
+
+def cache_mode(report: dict | None) -> str:
+    if not report:
+        return "unknown"
+    if report.get("gpu_mode") in ("owner", "shadow"):
+        return "gpu" if report["gpu_mode"] == "owner" else "shadow"
+    return "cpu" if (report.get("cpu") or {}).get("cache_enabled") else "off"
+
+
 NO_THINK = " /no_think"
 
 
@@ -534,7 +551,8 @@ def scene_cancel(cl: Client, ctx: dict) -> dict:
         if rep is None:
             break
         g = rep.get("gpu") or {}
-        if g.get("quiescent", True) and rep["pages"]["pending_returns"] == 0:
+        idle = rep.get("quiescent", g.get("quiescent", True))
+        if idle and rep["pages"]["pending_returns"] == 0:
             quiet = rep
             break
         time.sleep(0.25)
@@ -651,14 +669,17 @@ def scene_load(cl: Client, ctx: dict) -> dict:
     out = {"requests": total, "completed": ok_count,
            "leader_ttft_p50": p50(ttft(leaders)), "follower_ttft_p50": p50(ttft(follow)),
            "leader_s": t_lead, "follower_s": t_follow}
-    st0, st1, st2 = gpu_stats(start), gpu_stats(mid), gpu_stats(end)
-    if st2:
-        hits = st2.get("match_pages", 0) - st1.get("match_pages", 0)
+    if cache_mode(end) in ("gpu", "shadow", "cpu"):
+        hits = matched_pages(end) - matched_pages(mid)
         best = len(follow) * 8
-        ev = st2.get("evicted", 0) - st0.get("evicted", 0)
+        ev = (counter(end, "evicted", "cache_evicted")
+              - counter(start, "evicted", "cache_evicted"))
+        holds = (counter(end, "admit_hold", "publish_holds")
+                 - counter(start, "admit_hold", "publish_holds"))
         ok(f"followers reused {hits} of at most {best} prompt pages; "
-           f"{ev} blocks evicted to make room, {st2.get('admit_hold', 0)} admissions held")
-        out.update(follower_pages_hit=hits, follower_pages_possible=best, evicted=ev)
+           f"{ev} blocks evicted to make room, {holds} admissions held")
+        out.update(follower_pages_hit=hits, follower_pages_possible=best,
+                   evicted=ev, holds=holds)
     if end:
         pg, held = end["pages"], cached_pages(end)
         conserved = pg["gpu_free"] + pg["pending_returns"] + held == pg["total"]
@@ -669,12 +690,34 @@ def scene_load(cl: Client, ctx: dict) -> dict:
 
 
 def scene_internals(cl: Client, ctx: dict) -> dict:
-    scene_header(11, "GPU prefix cache internals",
-                 "Read back from the kernel once the engine is idle (GET /debug/prefix_cache).")
     rep = cl.cache(settle=3.0)
-    if not rep or "gpu" not in rep:
-        info(yellow("this server has no GPU prefix cache (start it with --gpu-prefix-cache)"))
+    mode = cache_mode(rep)
+    where = {"gpu": "read back from the kernel", "shadow": "GPU index checked against the CPU cache",
+             "cpu": "read from the CPU owner thread"}.get(mode, "")
+    scene_header(11, "Prefix cache internals",
+                 f"Once the engine is idle ({where or 'no cache'}; GET /debug/prefix_cache).")
+    if mode in ("off", "unknown"):
+        info(yellow("this server runs without a prefix cache"))
         return {}
+    if mode == "cpu":
+        c, pg = rep["cpu"], rep["pages"]
+        held = cached_pages(rep)
+        conserved = pg["gpu_free"] + pg["pending_returns"] + held == pg["total"]
+        (ok if conserved else bad)(
+            f"page conservation: {pg['gpu_free']} free + {pg['pending_returns']} returning + "
+            f"{held} cached = {pg['total']} pages")
+        (ok if not c.get("anomalies") else bad)(
+            f"page export reconciliation: {c.get('anomalies', 0)} anomalies over "
+            f"{c.get('completions', 0)} completions")
+        table([[c.get("completions"), c.get("imported_pages"), c.get("cache_inserted"),
+                c.get("cache_deduped"), c.get("cache_evicted"), c.get("returned_pages"),
+                c.get("publish_holds", 0)]],
+              ["completions", "pages hit", "inserted", "deduped", "evicted", "returned", "holds"])
+        info(f"capacity {c.get('cache_capacity_pages')} pages (pool minus one worst-case request)"
+             f" · backpressure ticks {c.get('cache_backpressure_ticks', 0)}")
+        return {"mode": mode, "pages": pg, "cached": held, "conserved": conserved,
+                "stats": {k: c.get(k) for k in ("completions", "imported_pages",
+                          "cache_inserted", "cache_evicted", "publish_holds")}}
     g, st, pg = rep["gpu"], rep["gpu"]["gpu_stats"], rep["pages"]
     held = cached_pages(rep)
     conserved = pg["gpu_free"] + pg["pending_returns"] + held == pg["total"]

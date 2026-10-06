@@ -61,6 +61,18 @@ Numbers are from the recorded run on one B200 with Qwen3-0.6B, page size 64, 256
 | 10 | Load and eviction | 24 distinct system prompts (24 cold leaders, then 48 followers), 8 at a time | 72/72 done; followers reuse 334 of 384 possible pages while 104 blocks are evicted; 0 admission holds | GPU cache |
 | 11 | Cache internals | read back from the kernel when idle | page conservation holds; 185 blocks, 0 structural errors; match 12 µs, insert 21 µs, evict 5 µs per block | GPU cache |
 
+**Both cache modes pass every scene.** The demo was run with `--cache gpu` and `--cache cpu` side by side on two GPUs (2026-10-06): 11/11 scenes and 26/26 checks in each. Transcripts: `~/oipl/bench/demo_transcript_{gpu,cpu}.txt`.
+
+| Scene | CPU cache | GPU cache |
+|---|---|---|
+| 5 Prefix cache | 8 pages reused; TTFT 136.8 → 21.1 ms | 8 pages reused; TTFT 135.6 → 21.3 ms |
+| 6 Multi-turn | reuses 4, then 5 pages; recalls the code | reuses 4, then 5 pages; recalls the code |
+| 8 Disconnect | 1 abandoned; all pages back | 1 abandoned; all pages back |
+| 10 Load | followers reuse 384/384 pages; 17 evictions; followers done in 2.07 s, TTFT p50 318 ms | followers reuse 329/384 pages; 109 evictions; followers done in 1.89 s, TTFT p50 278 ms |
+| 11 Internals | 222 pages cached; conservation holds | 185 blocks; conservation holds; 0 structural errors |
+
+Scene 10 is the one real difference. The CPU cache keeps up to 224 pages and admits a request only when free pages cover its worst case, so it keeps every prefix but runs fewer requests at once. The GPU cache evicts at the admission gate to make room for that worst-case reservation (32 pages per request at 2,048 tokens, though these requests use far fewer), so it reuses fewer pages but keeps more requests running and finishes sooner. Reserving less than the full worst case would let it keep more of the cache; that is a possible next step, not something this branch does.
+
 What to point at while presenting:
 
 - **Scene 5** is the headline: the same request is 6× faster to its first token once its prefix is cached, and a request that shares nothing pays the cold price.

@@ -208,17 +208,18 @@ async def complete(request: Request, chat: bool):
 
 @app.get("/debug/prefix_cache")
 async def debug_prefix_cache(settle: float = 2.0):
-    """CPU cache counters plus, with --gpu-prefix-cache, the GPU index's
-    counters and a diff of the two indexes taken once the engine is idle."""
+    """Cache counters and page accounting, taken once the engine is idle; with
+    --gpu-prefix-cache also the GPU index's counters and its self-check (or,
+    in shadow mode, its diff against the CPU cache)."""
     runtime = app.state.engine.runtime
-    report = {"cpu": await asyncio.to_thread(lambda: runtime.page_stats),
+    # Counters and pages are read once the engine is idle (or after *settle*
+    # seconds), in every cache mode: page conservation -- free + cached (+
+    # pending returns, CPU mode) == pool -- only holds at quiesce.
+    idle = await asyncio.to_thread(runtime.idle_snapshot, settle)
+    report = {"cpu": idle["cpu"],
               "gpu_mode": runtime.gpu_prefix_mode,
-              # Page conservation at quiesce: free + cached (+ pending
-              # returns, CPU mode) must equal the pool.
-              "pages": {"total": runtime.max_num_pages,
-                        "page_size": runtime.page_size,
-                        "gpu_free": runtime.gpu_free_page_count,
-                        "pending_returns": runtime.pending_page_returns}}
+              "quiescent": idle["quiescent"],
+              "pages": idle["pages"]}
     if runtime.gpu_prefix_enabled:
         report["gpu"] = await asyncio.to_thread(runtime.gpu_prefix_check, settle)
         # Taken once the engine is idle, together with the index snapshot.
