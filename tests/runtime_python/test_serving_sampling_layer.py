@@ -28,10 +28,12 @@ def sample():
     device = torch.cuda.current_device()
     workers, schedulers = mirage.get_configurations_from_gpu(device)
     capacity = 32
+    # page_size is part of the OIPL meta-tensor geometry (page export/import
+    # arrays, prefix index); it must match the kernel's below.
     config = SimpleNamespace(max_num_batched_requests=capacity,
                              max_num_batched_tokens=capacity,
                              max_seq_length=16, max_num_pages=capacity,
-                             pinned_ring_capacity=64)
+                             pinned_ring_capacity=64, page_size=16)
     meta = ModelRunner._allocate_meta_tensors(config)
     params = PersistentKernel.get_default_init_parameters()
     params.update(mode="online_pinned", test_mode=True, num_workers=workers,
@@ -39,7 +41,7 @@ def sample():
                   max_num_batched_requests=capacity,
                   max_num_batched_tokens=capacity,
                   max_seq_length=config.max_seq_length,
-                  max_num_pages=config.max_num_pages, page_size=16,
+                  max_num_pages=config.max_num_pages, page_size=config.page_size,
                   pinned_ring_capacity=config.pinned_ring_capacity,
                   meta_tensors=meta)
     pk = PersistentKernel(**params)
@@ -49,9 +51,12 @@ def sample():
                               pk.attach_input(output, name="output"))
     pk.compile()
 
-    adapter = SimpleNamespace(metadata=SimpleNamespace(mode="online_pinned"),
+    adapter = SimpleNamespace(metadata=SimpleNamespace(mode="online_pinned",
+                                                       page_size=config.page_size),
                               pinned_ring_capacity=config.pinned_ring_capacity,
                               total_num_requests=capacity, persistent_kernel=pk,
+                              max_num_pages=config.max_num_pages,
+                              max_seq_length=config.max_seq_length,
                               **meta)
     runtime = OnlinePinnedRuntime(adapter)
     runtime.reset()

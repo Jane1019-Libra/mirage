@@ -47,6 +47,11 @@ setup(
                     '-gencode=arch=compute_100a,code=sm_100a',
                     '-DMIRAGE_GRACE_BLACKWELL',
                     '-DMPK_ENABLE_TMA',
+                    # The Blackwell task header now includes the SM100
+                    # sampler, which sizes its request scan by these; the
+                    # paging kernels under test never read them.
+                    '-DMPK_MAX_NUM_BATCHED_REQUESTS=4',
+                    '-DMPK_MAX_NUM_BATCHED_TOKENS=8',
                 ]
             }
         )
