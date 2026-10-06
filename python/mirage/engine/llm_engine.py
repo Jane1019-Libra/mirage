@@ -10,6 +10,7 @@ from typing import Sequence
 
 import torch
 
+from .sampling import SamplingParams
 from .model_runner import ModelRunner
 from .tokenizer_manager import TokenizerManager
 from ..mpk.online_pinned_runtime import OnlinePinnedRuntime
@@ -34,12 +35,14 @@ class _StreamingMonitor:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def register(self, rid: int, prompt_len: int, timeout: float) -> queue.Queue:
+    def register(self, rid: int, prompt_len: int, timeout: float,
+                 return_token_ids: bool = False) -> queue.Queue:
         """Register a streaming session and return its token queue."""
         q: queue.Queue = queue.Queue()
         with self._lock:
             self._sessions[rid] = {
                 'q': q,
+                'return_token_ids': return_token_ids,
                 'prompt_len': prompt_len,
                 'row': -1,
                 'last_step': prompt_len - 1,
@@ -119,10 +122,14 @@ class _StreamingMonitor:
                                     rid, s, row, s['last_step'] + 1,
                                     final_step, True))
                             else:
+                                # The row's finish reason is only valid until
+                                # the release lets the GPU lease the row again.
+                                final = self._final_marker(s, row)
                                 if not self._runtime.release_request(rid):
                                     raise RuntimeError(
                                         f"missing completion for rid={rid}")
-                                s['q'].put(("", True))
+                                s['q'].put((None if s['return_token_ids'] else "",
+                                            final))
                                 self._remove(rid, s)
                             continue
 
@@ -160,7 +167,7 @@ class _StreamingMonitor:
                             self._fail(rid, s, "__error__")
                     else:
                         for pending, tokens in zip(pending_reads, token_batches):
-                            rid, s, _row, _start, _end, completed = pending
+                            rid, s, row, _start, _end, completed = pending
                             if not self._is_active(rid, s):
                                 continue
                             if s['cancelled']:
@@ -170,16 +177,21 @@ class _StreamingMonitor:
                             released = False
                             try:
                                 token_ids = tokens.tolist()
-                                texts = self._tokenizer_manager.decode_each(token_ids)
+                                # API sessions get raw ids and detokenize
+                                # incrementally themselves (multi-byte text).
+                                items = (token_ids if s['return_token_ids']
+                                         else self._tokenizer_manager.decode_each(token_ids))
+                                final = False
                                 if completed:
+                                    final = self._final_marker(s, row)
                                     released = self._runtime.release_request(rid)
                                     if not released:
                                         raise RuntimeError(
                                             f"missing completion for rid={rid}")
-                                for index, text in enumerate(texts):
+                                for index, item in enumerate(items):
                                     s['last_step'] += 1
-                                    is_final = completed and index == len(texts) - 1
-                                    s['q'].put((text, is_final))
+                                    last = completed and index == len(items) - 1
+                                    s['q'].put((item, final if last else False))
                                 if completed:
                                     self._remove(rid, s)
                             except Exception:
@@ -200,6 +212,14 @@ class _StreamingMonitor:
             else:
                 # No streams: sleep until register() or shutdown() wakes us.
                 self._wake.wait()
+
+    def _final_marker(self, s: dict, row: int):
+        """The *is_final* value of a session's last item.
+
+        Text sessions get ``True``.  Token-id sessions get the kernel's finish
+        reason (``"stop"`` / ``"length"``), read before the row is released.
+        """
+        return self._runtime.finish_reason(row) if s['return_token_ids'] else True
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -245,6 +265,8 @@ class LLMEngine:
         self.model_runner = model_runner
         self.runtime: OnlinePinnedRuntime = model_runner.runtime
         self.tokenizer_manager = TokenizerManager(model_runner.tokenizer)
+        self.vocab_size = model_runner.vocab_size
+        self.eos_ids = model_runner.eos_ids
 
         # Monotonically incrementing request id (never wraps).
         self._next_rid: int = 0
@@ -268,12 +290,15 @@ class LLMEngine:
 
     def submit(
         self,
-        prompt: str | None = None,
+        prompt: str | list[int] | None = None,
         use_template: bool = True,
         timeout: float = 120.0,
         poll_interval: float = 1e-4,
         stream: bool = False,
         messages: Sequence[dict] | None = None,
+        *,
+        sampling_params: SamplingParams | None = None,
+        return_token_ids: bool = False,
     ):
         """Submit one request — a chat conversation or a single prompt.
 
@@ -281,8 +306,10 @@ class LLMEngine:
         queues it for admission under an internal lock.
 
         Args:
-            prompt:        String prompt; exclusive with *messages*.
-            use_template:  Apply chat template before tokenizing (*prompt* only).
+            prompt:        String prompt, or already-tokenized ids; exclusive
+                           with *messages*.
+            use_template:  Apply chat template before tokenizing (string
+                           *prompt* only).
             timeout:       Seconds to wait before raising :exc:`TimeoutError`.
             poll_interval: Seconds between completion-ring polls.
             stream:        If True, returns a generator yielding ``(text,
@@ -290,6 +317,9 @@ class LLMEngine:
             messages:      OpenAI messages list, rendered in full through the
                            chat template so a multi-turn conversation keeps a
                            growing token prefix.
+            sampling_params: Per-request sampling settings; omitted uses startup defaults.
+            return_token_ids: Stream ``(token_id, finish_reason)`` for API formatting.
+                              The reason is False until completion; token_id may be None.
 
         Returns:
             When stream=False: ``{"text": str, "token_ids": list[int]}``
@@ -299,9 +329,14 @@ class LLMEngine:
             raise ValueError("submit takes exactly one of prompt= or messages=")
         if messages is not None:
             token_ids = self.tokenizer_manager.tokenize_messages(messages)
-        else:
+        elif isinstance(prompt, str):
             token_ids = self.tokenizer_manager.tokenize(prompt, use_template)
+        else:
+            token_ids = list(prompt)
         prompt_len = len(token_ids)
+        params = sampling_params or SamplingParams(**self.model_runner.config.sampling_defaults())
+        config = params.pack(prompt_len, self.model_runner.config.max_seq_length,
+                             self.vocab_size, self.eos_ids)
 
         t = torch.tensor(token_ids, dtype=torch.int64)
         stream_queue: queue.Queue | None = None
@@ -312,9 +347,9 @@ class LLMEngine:
             self._next_rid += 1
             if stream:
                 stream_queue = self._monitor.register(
-                    rid, prompt_len, timeout)
+                    rid, prompt_len, timeout, return_token_ids)
             try:
-                self.runtime.submit(rid, t)
+                self.runtime.submit(rid, t, generation_config=config)
             except Exception:
                 if stream:
                     self._monitor.unregister(rid)

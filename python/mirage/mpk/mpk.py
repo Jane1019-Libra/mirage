@@ -79,11 +79,21 @@ class MPKMetadata:
     pinned_page_free_count_mirror: Optional[torch.Tensor] = None
     gpu_prefix_table: Optional[torch.Tensor] = None
     gpu_prefix_ctl: Optional[torch.Tensor] = None
+    pinned_generation_config: Optional[torch.Tensor] = None
+    generation_config: Optional[torch.Tensor] = None
+    pinned_finish_reason: Optional[torch.Tensor] = None
     # spec decode config
     spec_decode: Optional[str] = None
     spec_decode_config: Optional[object] = None
     # use cutlass kernel
     use_cutlass_kernel: bool = True
+    # Token sampling (compiled into the graph; one config per process)
+    do_sample: bool = False
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    sampling_seed: int = 42
+    sampling_topk_max: int = 32
     
     def check_valid(self):
         if self.weight_from_model:
@@ -232,6 +242,9 @@ class MPK:
         self.pinned_page_free_count_mirror  = args.pinned_page_free_count_mirror
         self.gpu_prefix_table               = args.gpu_prefix_table
         self.gpu_prefix_ctl                 = args.gpu_prefix_ctl
+        self.pinned_generation_config = args.pinned_generation_config
+        self.generation_config       = args.generation_config
+        self.pinned_finish_reason    = args.pinned_finish_reason
 
         self.profiler_tensor = args.profiler_tensor
         self.spec_decode_config = args.spec_decode_config
@@ -248,6 +261,7 @@ class MPK:
             self.num_schedulers = args.num_schedulers
         print(f"num_workers: {self.num_workers}, num_schedulers: {self.num_schedulers}")
         # init meta tensors
+        # Versioned serving settings: ring payload is copied into private row state.
         meta_tensors = {
             "step": self.step,
             "tokens": self.tokens,
@@ -284,6 +298,9 @@ class MPK:
             "pinned_page_free_count_mirror":  args.pinned_page_free_count_mirror,
             "gpu_prefix_table":               args.gpu_prefix_table,
             "gpu_prefix_ctl":                 args.gpu_prefix_ctl,
+            "pinned_generation_config": args.pinned_generation_config,
+            "generation_config":        args.generation_config,
+            "pinned_finish_reason":     args.pinned_finish_reason,
         }
         self.persistent_kernel = PersistentKernel(
             mode=args.mode,
@@ -303,8 +320,14 @@ class MPK:
             spec_decode_config=self.spec_decode_config,
             use_cutlass_kernel=args.use_cutlass_kernel,
             pinned_ring_capacity=args.pinned_ring_capacity,
+            do_sample=args.do_sample,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            sampling_seed=args.sampling_seed,
+            sampling_topk_max=args.sampling_topk_max,
         )
-        self.meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors.values()]
+        self.meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors.values() if tensor is not None]
         self.profiler_buffer_ptr = (
             self.persistent_kernel.profiler_tensor.data_ptr() if self.persistent_kernel.profiler_tensor is not None else 0
         )
@@ -490,7 +513,7 @@ class MPK:
         model_builder_class = get_builder(self.model_name)
         self.model_builder = model_builder_class(self.persistent_kernel)
         if self.weight_from_model:
-            self.model_builder.build_from_model(model_name=self.model_name)
+            self.model_builder.build_from_model(model_name=self.model_name, model_path=self.metadata.model_path)
             self.tokenizer = self.model_builder.tokenizer
         else:
             self.model_builder.build_from_config(self.model_config)

@@ -55,6 +55,8 @@
 #include "tasks/ampere/task_header.cuh"
 #endif
 
+#include "tasks/common/serving_sampling.cuh"
+
 using bfloat16 = type::bfloat16_t;
 using namespace mirage::runtime;
 // Configurations for the MPK runtime
@@ -528,7 +530,7 @@ constexpr int PC_OP_INSERT = 2;
 constexpr int PC_OP_EVICT = 3;
 constexpr int PC_OP_EXIT = 4;
 constexpr unsigned PC_HELPER_MASK = 0xFFFFFFFEu;
-__shared__ PcMailbox pc_mailbox[4]; // one per scheduler warp of the block
+__shared__ PcMailbox pc_mailbox[SCHEDULERS_PER_BLOCK]; // one per scheduler warp
 
 __device__ __forceinline__ void pc_helper_loop(RuntimeConfig const &config,
                                                int lane,
@@ -680,7 +682,7 @@ __device__ __forceinline__ bool
   // Helper lanes of this warp, if armed (see pc_helper_loop).
   PcMailbox volatile *pc_mb =
       (pc_enabled && pc_ctl[PC_CTL_WARP] != 0)
-          ? &pc_mailbox[(threadIdx.x / 32) & 3]
+          ? &pc_mailbox[threadIdx.x / 32]
           : nullptr;
 
   // Reclaim rows only after the CPU has copied their completed output and
@@ -724,6 +726,18 @@ __device__ __forceinline__ bool
     }
   }
 
+  // Reclaim rows only after the CPU has copied their completed output and
+  // release-stored -1 to pinned_step. The owner mapping stays stable for the
+  // full CPU read, so a completion can never refer to a reused row.
+  for (int row = 0; row < MPK_MAX_NUM_BATCHED_REQUESTS; row++) {
+    int32_t owner = ld_acquire_sys_i32(&config.pinned_rid_at_row[row]);
+    int32_t progress = ld_acquire_sys_i32(&config.pinned_step[row]);
+    if (owner >= 0 && progress == -1) {
+      st_release_sys_i32(&config.pinned_rid_at_row[row], -1);
+      config.free_rows[free_row_top++] = row;
+    }
+  }
+
   // ── Step 1: finalize previous batch ────────────────────────────────────────
   for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
     int16_t row = config.request_ids[i];
@@ -753,10 +767,12 @@ __device__ __forceinline__ bool
 #ifdef MPK_ENABLE_PROFILING
     bool done = true;
 #else
-    bool done = (step + num_tokens + 1 >= config.max_seq_length) ||
-                ((config.tokens[row * MPK_MAX_SEQ_LENGTH + step + num_tokens] ==
-                  config.eos_token_id) &&
-                 (step + num_tokens >= prompt_len));
+    int reason = mirage::serving::finish_reason(
+        config.generation_config + row,
+        config.tokens + row * MPK_MAX_SEQ_LENGTH, step + num_tokens + 1,
+        prompt_len, config.max_seq_length, config.eos_token_id);
+    bool done = reason != mirage::serving::FINISH_NONE;
+    config.pinned_finish_reason[row] = reason;
 #endif
 
     if (done) {
@@ -1021,6 +1037,10 @@ __device__ __forceinline__ bool
     avail_uncommitted -= worst_need;
     config.reserved_remaining[row] = worst_need;
     config.gpu_row_num_prefix_pages[row] = num_prefix_pages;
+    // Per-request sampling settings ride the ring slot; the row keeps its own
+    // copy because the CPU may reuse the slot as soon as it is released below.
+    config.generation_config[row] = config.pinned_generation_config[req_slot];
+    config.pinned_finish_reason[row] = 0;
     config.prompt_length[row] = prompt_len;
     config.step[row] = initial_step;
 
@@ -1251,10 +1271,10 @@ __device__ __forceinline__ void persistent_checker(RuntimeConfig config) {
   assert(gridDim.y == 1);
   assert(gridDim.z == 1);
   // Each worker SM serves a single worker
-  // Each scheduelr SM serves four schedulers
+  // Each scheduler SM serves four schedulers
   int const num_schedulers =
       config.num_local_schedulers + config.num_remote_schedulers;
-  int const num_schedulers_per_sm = std::min((int)blockDim.x / 32, 4);
+  int const num_schedulers_per_sm = SCHEDULERS_PER_BLOCK;
   assert(num_schedulers % num_schedulers_per_sm == 0);
   assert(gridDim.x ==
          config.num_workers + num_schedulers / num_schedulers_per_sm);
@@ -1562,7 +1582,6 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
   }
 }
 
-// need to alter as there is only one warp per block
 __device__ __forceinline__ void execute_scheduler_lane0(RuntimeConfig config,
                                                         int offset);
 
@@ -1571,14 +1590,15 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
 #if defined(MODE_ONLINE_PINNED)
   int const lane = threadIdx.x % 32;
   int const warp_id = threadIdx.x / 32;
-  bool const sched_warp = warp_id < std::min((int)blockDim.x / 32, 4);
+  // Same predicate execute_scheduler_lane0 uses to pick its scheduler warps.
+  bool const sched_warp = warp_id < SCHEDULERS_PER_BLOCK;
   bool const helpers_armed =
       sched_warp && config.gpu_prefix_ctl[PC_CTL_ENABLED] != 0 &&
       config.gpu_prefix_ctl[PC_CTL_WARP] != 0;
   if (helpers_armed) {
     // The warp is still converged here: lane 0 initialises the mailbox and
     // every lane sees it before anyone reads it.
-    PcMailbox volatile *mb = &pc_mailbox[warp_id & 3];
+    PcMailbox volatile *mb = &pc_mailbox[warp_id];
     if (lane == 0) {
       mb->seq = 0;
       mb->done = 0;
@@ -1605,9 +1625,8 @@ __device__ __forceinline__ void execute_scheduler_lane0(RuntimeConfig config,
                                                         int offset) {
   int const num_schedulers =
       config.num_local_schedulers + config.num_remote_schedulers;
-  // if we have more than 4 warps per thread block
-  // only the first 4 warps will run schedulers
-  int const num_schedulers_per_sm = std::min((int)blockDim.x / 32, 4);
+  // Only the first SCHEDULERS_PER_BLOCK warps run schedulers.
+  int const num_schedulers_per_sm = SCHEDULERS_PER_BLOCK;
   int const warp_id = threadIdx.x / 32;
   // CANNOT use syncthreads below
 
@@ -1879,7 +1898,7 @@ __global__ __launch_bounds__(WORKER_NUM_THREADS,
   if (blockIdx.x < config.num_workers) {
     execute_worker(config);
   } else {
-    execute_scheduler(config, -(4 * config.num_workers));
+    execute_scheduler(config, -(SCHEDULERS_PER_BLOCK * config.num_workers));
   }
 }
 
@@ -1938,7 +1957,7 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[8]: paged_kv_indices_buffer
 // meta_tensors[9]: paged_kv_last_page_len_buffer
 // meta_tensors[10]: paged_kv_indices_snapshot
-// MODE_ONLINE_PINNED only (indices 11..30):
+// MODE_ONLINE_PINNED only (indices 11..35):
 // meta_tensors[11]: pinned_req_ready
 // meta_tensors[12]: pinned_req_request_id
 // meta_tensors[13]: pinned_req_prompt_len
@@ -1961,6 +1980,9 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[30]: pinned_page_free_count_mirror
 // meta_tensors[31]: gpu_prefix_table (device)
 // meta_tensors[32]: gpu_prefix_ctl (device)
+// meta_tensors[33]: pinned_generation_config
+// meta_tensors[34]: generation_config
+// meta_tensors[35]: pinned_finish_reason
 
 extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
@@ -1981,6 +2003,9 @@ extern "C" void
                            int allocate_nvshmem_teams,
                            std::vector<std::string> model_tensor_names,
                            std::vector<void *> model_tensor_ptrs) {
+  assert(num_local_schedulers > 0 &&
+         num_local_schedulers % SCHEDULERS_PER_BLOCK == 0);
+
   // Build global model tensors map from parallel vectors
   assert(model_tensor_names.size() == model_tensor_ptrs.size());
   global_model_tensors.clear();
@@ -1988,11 +2013,12 @@ extern "C" void
     global_model_tensors[model_tensor_names[i]] = model_tensor_ptrs[i];
   }
   // meta_tensors[0..10] are always required.
-  // meta_tensors[11..30]: pinned ring pointers (MODE_ONLINE_PINNED only,
+  // meta_tensors[11..35]: pinned ring, page-lifecycle, prefix-index and
+  //   generation pointers (MODE_ONLINE_PINNED only,
   //   passed as CPU-side void* from Python's pinned tensors)
   // meta_tensors[31..32]: GPU prefix index table and control block (device)
 #if defined(MODE_ONLINE_PINNED)
-  assert(meta_tensors.size() == 33);
+  assert(meta_tensors.size() == 36);
 #else
   assert(meta_tensors.size() == 11);
 #endif
@@ -2056,6 +2082,12 @@ extern "C" void
       static_cast<int32_t volatile *>(meta_tensors[30]);
   global_runtime_config.gpu_prefix_table = meta_tensors[31];
   global_runtime_config.gpu_prefix_ctl = static_cast<int32_t *>(meta_tensors[32]);
+  global_runtime_config.pinned_generation_config =
+      static_cast<mirage::serving::ServingConfig *>(meta_tensors[33]);
+  global_runtime_config.generation_config =
+      static_cast<mirage::serving::ServingConfig *>(meta_tensors[34]);
+  global_runtime_config.pinned_finish_reason =
+      static_cast<int32_t *>(meta_tensors[35]);
 #endif
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
@@ -2356,11 +2388,15 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
                     global_runtime_config.worker_stream>>>(
         global_runtime_config);
 
-    scheduler_kernel<<<dim3(global_runtime_config.num_local_schedulers, 1, 1),
-                       dim3(32, 1, 1),
-                       0 /*smem*/,
-                       global_runtime_config.scheduler_stream>>>(
-        global_runtime_config);
+    // Pack scheduler warps into blocks so they leave enough SMs for workers,
+    // even when CUDA starts the schedulers before the workers.
+    scheduler_kernel<<<
+        dim3(global_runtime_config.num_local_schedulers / SCHEDULERS_PER_BLOCK,
+             1,
+             1),
+        dim3(32 * SCHEDULERS_PER_BLOCK, 1, 1),
+        0 /*smem*/,
+        global_runtime_config.scheduler_stream>>>(global_runtime_config);
 
 #ifdef MODE_OFFLINE
     cudaEventRecord(global_runtime_config.worker_done_event,
@@ -2376,7 +2412,8 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
     printf("Finished Launching Persistent Kernel (Async)\n");
   } else {
     printf("a single persistent kernel\n");
-    int num_sms_to_use = global_runtime_config.num_workers + num_schedulers / 4;
+    int num_sms_to_use = global_runtime_config.num_workers +
+                         num_schedulers / SCHEDULERS_PER_BLOCK;
 #ifdef USE_NVSHMEM
     void *args[] = {&global_runtime_config};
     nvshmemx_collective_launch((void const *)persistent_kernel,

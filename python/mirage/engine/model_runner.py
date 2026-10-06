@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from ..mpk.mpk import MPK, MPKMetadata
 from ..mpk import OnlinePinnedRuntime
+from ..mpk.model_registry import get_builder
 from ..mpk.models.graph_builder import MirageModelConfig
 from ..mpk.persistent_kernel import (
     gpu_prefix_table_size,
@@ -19,6 +20,8 @@ from ..mpk.persistent_kernel import (
 )
 from ..mpk.prefix_cache import compute_gen_tail_len
 from ..mpk.gpu_prefix_cache import PC_CTL_SIZE, table_bytes
+from ..mpk.models.qwen3.builder import Qwen3Builder
+from ..core import serving_config_words
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -66,7 +69,23 @@ class RunnerConfig:
     ``enable_prefix_cache`` it only shadows the CPU cache, and the runtime
     can diff the two (``gpu_prefix_check``)."""
 
-    use_cutlass_kernel: bool = True
+    # Use Mirage's PTX kernels by default; the Ampere CUTLASS serving tiles
+    # exceed the shared-memory budget on GPUs such as the RTX A5000.
+    use_cutlass_kernel: bool = False
+
+    # Startup defaults for per-request sampling in online_pinned mode.
+    do_sample: bool = False
+    temperature: float = 0.8
+    top_p: float = 0.95
+    top_k: int = 20
+    sampling_seed: int = 42
+    sampling_topk_max: int = 32
+
+    def sampling_defaults(self):
+        if not self.do_sample:
+            return {}
+        return dict(temperature=self.temperature, top_p=self.top_p,
+                    top_k=self.top_k, seed=self.sampling_seed)
 
 
 # ── ModelRunner ───────────────────────────────────────────────────────────────
@@ -86,6 +105,8 @@ class ModelRunner:
         rank: Optional[int] = None,
     ) -> None:
         self.config = config
+        if get_builder(config.model) is not Qwen3Builder:
+            raise ValueError("Serving sampling currently supports only Qwen3 models")
 
         # ── Distributed init ──────────────────────────────────────────────
         self.rank, self.world_size = self._init_distributed(rank)
@@ -112,11 +133,24 @@ class ModelRunner:
             model_path=config.model_path,
             model_config=MirageModelConfig(with_lm_head=True),
             use_cutlass_kernel=config.use_cutlass_kernel,
+            do_sample=config.do_sample,
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            sampling_seed=config.sampling_seed,
+            sampling_topk_max=config.sampling_topk_max,
             **self.meta_tensors,
         )
         self.mpk = MPK(mpk_meta)
         self.mpk.build()
         self.tokenizer = self.mpk.tokenizer
+        self.vocab_size = self.mpk.model_builder.vocab_size
+        generation_config = getattr(getattr(self.mpk.model_builder, "model", None), "generation_config", None)
+        eos = getattr(generation_config, "eos_token_id", None)
+        if eos is None:
+            eos = self.tokenizer.eos_token_id
+        self.eos_ids = list(dict.fromkeys(eos if isinstance(eos, list) else [eos]))
+        self.eos_ids = [token for token in self.eos_ids if token is not None]
         # The chat template re-renders the generation prompt every turn, so the
         # tail it inserts is not a stable prefix of the next turn (§11-1);
         # measuring it once here keeps it out of the cacheable range.
@@ -207,6 +241,7 @@ class ModelRunner:
             paged_kv_indices_buffer=torch.zeros(config.max_num_pages, dtype=torch.int32, device="cuda"),
             paged_kv_last_page_len_buffer=torch.zeros(n_req, dtype=torch.int32, device="cuda"),
             paged_kv_indices_snapshot=torch.zeros(config.max_num_pages, dtype=torch.int32, device="cuda"),
+            generation_config=torch.zeros(n_req, serving_config_words(), dtype=torch.int64, device="cuda"),
             # Pinned ring buffers for CPU↔GPU communication.  pin_memory()
             # gives a stable physical address so no DMA copy is needed.
             pinned_req_ready=torch.zeros(cap, dtype=torch.int32).pin_memory(),
@@ -239,4 +274,6 @@ class ModelRunner:
                              config.page_size),),
                 255, dtype=torch.uint8, device="cuda"),
             gpu_prefix_ctl=torch.zeros(PC_CTL_SIZE, dtype=torch.int32, device="cuda"),
+            pinned_generation_config=torch.zeros(cap, serving_config_words(), dtype=torch.int64).pin_memory(),
+            pinned_finish_reason=torch.zeros(n_req, dtype=torch.int32).pin_memory(),
         )

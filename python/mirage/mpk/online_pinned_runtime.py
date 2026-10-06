@@ -53,7 +53,10 @@ import time
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
+
+from mirage.core import serving_config_words, serving_finish_reason_name
 
 from .persistent_kernel import max_pages_per_request
 from .prefix_cache import EMPTY_MATCH, Block, PrefixCache, PrefixMatch
@@ -127,6 +130,15 @@ class OnlinePinnedRuntime:
         self._pinned_step       = mpk.pinned_step             # int32[max_batched], pinned
         self._inbox_tokens      = mpk.pinned_inbox_tokens     # int64[cap, max_seq_len], pinned
         self._pinned_rid_at_row = mpk.pinned_rid_at_row       # int32[max_batched], pinned
+        # Per-request generation settings (sampling, budget, EOS ids) ride the
+        # request ring like the prompt does: one ServingConfig record per slot,
+        # written by the owner tick before ``ready`` is released and copied
+        # into the row's private state by Step 4.  A numpy view for the same
+        # reason as the scalar channels above.  The kernel reports why a row
+        # finished (stop / length) through ``pinned_finish_reason``.
+        self._generation_config = mpk.pinned_generation_config.numpy()
+        self._finish_reason     = mpk.pinned_finish_reason.numpy()
+        self._config_words      = serving_config_words()
 
         # OIPL page-lifecycle channels.  The CPU is the only page releaser: it
         # takes each completed request's exported page list and writes it into
@@ -163,7 +175,7 @@ class OnlinePinnedRuntime:
         # nothing -- no ring slot, no page pin -- so a queued request can never
         # wedge admission.
         self._admission: Deque[
-            Tuple[int, torch.Tensor, int, Optional[List[int]]]
+            Tuple[int, torch.Tensor, int, Optional[List[int]], np.ndarray]
         ] = collections.deque()
         self._admission_lock = threading.Lock()
 
@@ -236,7 +248,8 @@ class OnlinePinnedRuntime:
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def submit(self, rid: int, token_ids: torch.Tensor, initial_step: int = 0) -> None:
+    def submit(self, rid: int, token_ids: torch.Tensor, initial_step: int = 0,
+               generation_config=None) -> None:
         """Queue a request for the owner thread to publish.
 
         The submitting thread does not touch the request ring: it clones the
@@ -255,14 +268,34 @@ class OnlinePinnedRuntime:
         initial_step : starting decode step; leave at 0 to let the prefix cache
                        pick one.  A caller-chosen start disables matching for
                        that request, since the two cannot both set it.
+        generation_config : packed ``ServingConfig`` words (see
+                       :meth:`SamplingParams.pack`); ``None`` packs the
+                       defaults -- greedy, run to EOS or the context limit.
         """
         self._raise_drain_error()
+        if not 0 <= rid < 2**31:
+            raise ValueError("rid must fit int32")
+        if (token_ids.ndim != 1 or token_ids.dtype != torch.int64
+                or not 0 < len(token_ids) < self._inbox_tokens.shape[1]):
+            raise ValueError(
+                "expected a nonempty int64 prompt shorter than the context capacity")
+        if generation_config is None:
+            from ..engine.sampling import SamplingParams
+            vocab = getattr(self._mpk.model_builder, "vocab_size",
+                            len(self._mpk.tokenizer))
+            generation_config = SamplingParams().pack(
+                len(token_ids), self._inbox_tokens.shape[1], vocab,
+                [self._mpk.persistent_kernel.eos_token_id])
+        generation_config = np.asarray(generation_config, dtype=np.int64)
+        if generation_config.shape != (self._config_words,):
+            raise ValueError("invalid generation configuration ABI")
         # The prefix cache keys on plain ints, and this is the last thread that
         # can pay for the conversion without stealing owner-tick time.
         prompt_ids = token_ids.tolist() if self._cache is not None else None
         with self._admission_lock:
             self._admission.append(
-                (rid, token_ids.clone(), initial_step, prompt_ids))
+                (rid, token_ids.clone(), initial_step, prompt_ids,
+                 generation_config))
 
     def _publish_admissions(self) -> int:
         """Match, pin and publish queued requests while the ring has free slots.
@@ -282,7 +315,7 @@ class OnlinePinnedRuntime:
                 if not self._admission:
                     break
                 entry = self._admission.popleft()
-            rid, token_ids, initial_step, prompt_ids = entry
+            rid, token_ids, initial_step, prompt_ids, generation_config = entry
             match = self._match_at_publish(prompt_ids, initial_step)
             if not self._staging_room(match.num_prefix_pages):
                 # The GPU would refuse this request at its admission gate and
@@ -301,7 +334,8 @@ class OnlinePinnedRuntime:
                 initial_step = match.num_prefix_pages * self._page_size
             try:
                 self._publish_request_locked(
-                    slot, rid, token_ids, initial_step, match.page_ids)
+                    slot, rid, token_ids, initial_step, match.page_ids,
+                    generation_config)
             except Exception as exc:
                 # A request the CPU cannot stage (an over-long prompt, say)
                 # must not take the owner thread down with it: record the
@@ -377,6 +411,7 @@ class OnlinePinnedRuntime:
         token_ids: torch.Tensor,
         initial_step: int,
         prefix_pages: Sequence[int] = (),
+        generation_config: Optional[np.ndarray] = None,
     ) -> None:
         """Copy and publish one request from the owner tick.
 
@@ -391,6 +426,8 @@ class OnlinePinnedRuntime:
             self._inbox_tokens[slot, :prompt_len].copy_(
                 token_ids, non_blocking=True)
         self._write_stream.synchronize()
+        if generation_config is not None:
+            self._generation_config[slot] = generation_config
         self._req_request_id[slot] = rid
         self._req_prompt_len[slot] = prompt_len
         self._req_initial_step[slot] = initial_step
@@ -842,6 +879,14 @@ class OnlinePinnedRuntime:
             offset += length
         return results
 
+    def finish_reason(self, row: int) -> str:
+        """Why the request on *row* finished: ``"stop"`` or ``"length"``.
+
+        Valid between observing its completion and releasing the row; Step 4
+        clears it when the row is leased again.
+        """
+        return serving_finish_reason_name(int(self._finish_reason[row]))
+
     def get_completion(self, rid: int) -> Tuple[int, int] | None:
         """Return the completion for *rid*, if the GPU has published it."""
         with self._lock:
@@ -958,6 +1003,7 @@ class OnlinePinnedRuntime:
             self._failed.clear()
             self._drain_error = None
             self._comp_ready.zero_()
+            self._finish_reason[:] = 0
             self._comp_num_pages.zero_()
             self._comp_pages.zero_()
             # The relaunched kernel re-initializes its private return-ring head

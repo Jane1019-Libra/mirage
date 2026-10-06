@@ -328,7 +328,8 @@ void register_mugraph(
           for (int subtask_id = 0; subtask_id < num_subtasks; subtask_id++) {
             FullTaskDesc task(task_type, variant_id);
             // Set request_id for attention and paged_attention
-            if ((task_type == TASK_ATTENTION_1) ||
+            if ((task_type == TASK_SERVING_SAMPLING) ||
+                (task_type == TASK_ATTENTION_1) ||
                 (task_type == TASK_ATTENTION_2) ||
                 (task_type == TASK_SINGLE_BATCH_EXTEND_ATTENTION) ||
                 (task_type == TASK_PAGED_ATTENTION_1) ||
@@ -344,7 +345,8 @@ void register_mugraph(
             }
             // Argmax partial tasks: grid_dim.x partitions the vocab dimension
             if (task_type == TASK_ARGMAX_PARTIAL ||
-                task_type == TASK_ARGMAX_PARTIAL_SM100) {
+                task_type == TASK_ARGMAX_PARTIAL_SM100 ||
+                task_type == TASK_SAMPLING_PARTIAL_SM100) {
               task.task_metadata.task_offset = bid.x;
             }
             // Set expert_offset for MoE tasks
@@ -1799,7 +1801,10 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_ATTN_SM100] = "TASK_ATTN_SM100";
   task_type_to_name[TASK_ARGMAX_PARTIAL_SM100] = "TASK_ARGMAX_PARTIAL_SM100";
   task_type_to_name[TASK_ARGMAX_REDUCE_SM100] = "TASK_ARGMAX_REDUCE_SM100";
+  task_type_to_name[TASK_SERVING_SAMPLING] = "TASK_SERVING_SAMPLING";
   task_type_to_name[TASK_SAMPLING_SM100] = "TASK_SAMPLING_SM100";
+  task_type_to_name[TASK_SAMPLING_PARTIAL_SM100] =
+      "TASK_SAMPLING_PARTIAL_SM100";
   task_type_to_name[TASK_MLA_DECODE_SM100] = "TASK_MLA_DECODE_SM100";
   task_type_to_name[TASK_MLA_REDUCE_SM100] = "TASK_MLA_REDUCE_SM100";
   task_type_to_name[TASK_MLA_PREFILL_SM100] = "TASK_MLA_PREFILL_SM100";

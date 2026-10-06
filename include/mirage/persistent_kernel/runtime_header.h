@@ -16,6 +16,7 @@
 #pragma once
 
 #include "mirage/config.h"
+#include "mirage/persistent_kernel/serving_config.h"
 #include <cuda_runtime.h>
 
 #ifdef USE_NVSHMEM
@@ -25,6 +26,9 @@
 
 namespace mirage {
 namespace runtime {
+
+// Scheduler count per block, used for launch dimensions and scheduler IDs.
+constexpr int SCHEDULERS_PER_BLOCK = 4;
 
 #if defined(MIRAGE_GRACE_HOPPER) || defined(MIRAGE_GRACE_BLACKWELL)
 constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 6 * 1024;
@@ -106,6 +110,7 @@ enum TaskType {
   TASK_RMS_NORM = 119,
   TASK_LINEAR = 120,
   TASK_IDENTITY = 121,
+  TASK_SERVING_SAMPLING = 122,
   // Hopper Tasks
   TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
   TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,
@@ -160,6 +165,9 @@ enum TaskType {
   TASK_LINEAR_FP8_SM100 = 276,
   TASK_LINEAR_FP8_WITH_RESIDUAL_SM100 = 277,
   TASK_MLA_KV_GATHER_SM100 = 278,
+  // Per-chunk stage of temperature/top-k/top-p sampling. The reduce stage is a
+  // variant of TASK_SAMPLING_SM100.
+  TASK_SAMPLING_PARTIAL_SM100 = 279,
   TASK_MOE_TOPK_SIGMOID_SM100 = 280,
   TASK_ELEMENTWISE_ADD_SM100 = 281,
   TASK_SOFTMAX_GATHER_SM100 = 282,
@@ -413,6 +421,9 @@ struct RuntimeConfig {
   // allocating a buffer row so CPU can discover which row its request is
   // on by scanning rows, then poll pinned_step[row] for per-step streaming.
   int32_t volatile *pinned_rid_at_row; // [total_inflight], pinned
+  serving::ServingConfig *pinned_generation_config; // [ring_capacity], immutable until admitted
+  serving::ServingConfig *generation_config; // [max_requests], indexed by buffer row
+  int32_t *pinned_finish_reason; // row: 1=stop, 2=length
   // Running queue rid tracking: request_rids[i] stores the original rid
   // for active batch slot i (GPU device memory).
   int *request_rids; // [MPK_MAX_NUM_BATCHED_REQUESTS]
