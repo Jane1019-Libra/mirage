@@ -1,6 +1,6 @@
 """Showcase: OpenAI-compatible online serving on the MPK persistent megakernel.
 
-Drives a live server through ten short scenes, each exercising one feature end
+Drives a live server through eleven short scenes, each exercising one feature end
 to end and printing what it measured:
 
    1 server      /health, /v1/models, engine geometry
@@ -13,7 +13,8 @@ to end and printing what it measured:
    7 concurrent  8 simultaneous streams with private markers (isolation)
    8 cancel      a client hangs up mid-stream; the server recovers cleanly
    9 errors      OpenAI-style 400 / 404 answers for bad requests
-  10 internals   GPU prefix-cache health: page conservation, structure, cost
+  10 load        24 system prompts at once: the cache fills, evicts, keeps serving
+  11 internals   GPU prefix-cache health: page conservation, structure, cost
 
 Features come from three branches: the OpenAI layer and in-kernel per-request
 sampling (mirage-project/mirage#784), the batched streaming monitor with
@@ -32,7 +33,7 @@ Run it either way:
     python demo/qwen3/demo_serving_showcase.py --port 8000
 
 ``--scenes 5,6`` runs a subset; ``--report out.json`` saves every measurement.
-Scenes 5, 6 and 10 read ``GET /debug/prefix_cache``; against a server without a
+Scenes 5, 6, 10 and 11 read ``GET /debug/prefix_cache``; against a server without a
 prefix cache they still run and say so.
 """
 
@@ -599,8 +600,76 @@ def scene_errors(cl: Client, ctx: dict) -> dict:
     return {"cases": out}
 
 
+def scene_load(cl: Client, ctx: dict) -> dict:
+    scene_header(10, "Load and eviction",
+                 "24 different system prompts overflow the cache; it evicts on demand while serving.")
+    groups, followers, width = 24, 2, 8
+    names = [f"Store-{chr(65 + g // 6)}{g % 6}" for g in range(groups)]
+    system = lambda g: SYSTEM_SHOP.replace("Lantern Books", names[g]) * 3
+    qs = ["Who pays shipping for a misprinted book?", "Do gift cards expire?",
+          "How fast do e-books arrive?"]
+
+    def burst(jobs):
+        res: list[dict | None] = [None] * len(jobs)
+        nxt = {"i": 0}
+        lock = threading.Lock()
+
+        def worker():
+            while True:
+                with lock:
+                    i = nxt["i"]
+                    nxt["i"] += 1
+                if i >= len(jobs):
+                    return
+                g, q = jobs[i]
+                res[i] = cl.stream("/v1/chat/completions", {
+                    "messages": [{"role": "system", "content": system(g)},
+                                 {"role": "user", "content": q + NO_THINK}],
+                    "temperature": 0, "max_tokens": 16})
+        th = [threading.Thread(target=worker) for _ in range(width)]
+        t0 = time.perf_counter()
+        for t in th:
+            t.start()
+        for t in th:
+            t.join()
+        return res, time.perf_counter() - t0
+
+    start = cl.cache(settle=1.0)
+    leaders, t_lead = burst([(g, qs[0]) for g in range(groups)])
+    mid = cl.cache(settle=2.0)
+    jobs = [(g, qs[1 + k]) for k in range(followers) for g in range(groups)]
+    follow, t_follow = burst(jobs)
+    end = cl.cache(settle=3.0)
+    ttft = lambda rs: sorted(r["ttft_ms"] for r in rs if r and r["ttft_ms"])
+    p50 = lambda xs: xs[len(xs) // 2] if xs else float("nan")
+    ok_count = sum(1 for r in leaders + follow if r and r["status"] == 200 and r["done"])
+    total = len(leaders) + len(follow)
+    (ok if ok_count == total else bad)(f"{ok_count}/{total} requests completed")
+    info(f"  leaders   ({len(leaders)}, all cold) in {t_lead:.2f} s · TTFT p50 {p50(ttft(leaders)):.0f} ms")
+    info(f"  followers ({len(follow)}, same prompts) in {t_follow:.2f} s · "
+         f"TTFT p50 {p50(ttft(follow)):.0f} ms")
+    out = {"requests": total, "completed": ok_count,
+           "leader_ttft_p50": p50(ttft(leaders)), "follower_ttft_p50": p50(ttft(follow)),
+           "leader_s": t_lead, "follower_s": t_follow}
+    st0, st1, st2 = gpu_stats(start), gpu_stats(mid), gpu_stats(end)
+    if st2:
+        hits = st2.get("match_pages", 0) - st1.get("match_pages", 0)
+        best = len(follow) * 8
+        ev = st2.get("evicted", 0) - st0.get("evicted", 0)
+        ok(f"followers reused {hits} of at most {best} prompt pages; "
+           f"{ev} blocks evicted to make room, {st2.get('admit_hold', 0)} admissions held")
+        out.update(follower_pages_hit=hits, follower_pages_possible=best, evicted=ev)
+    if end:
+        pg, held = end["pages"], cached_pages(end)
+        conserved = pg["gpu_free"] + pg["pending_returns"] + held == pg["total"]
+        (ok if conserved else bad)(
+            f"after the burst: {pg['gpu_free']} free + {held} cached = {pg['total']} pages")
+        out["conserved"] = conserved
+    return out
+
+
 def scene_internals(cl: Client, ctx: dict) -> dict:
-    scene_header(10, "GPU prefix cache internals",
+    scene_header(11, "GPU prefix cache internals",
                  "Read back from the kernel once the engine is idle (GET /debug/prefix_cache).")
     rep = cl.cache(settle=3.0)
     if not rep or "gpu" not in rep:
@@ -634,7 +703,7 @@ def scene_internals(cl: Client, ctx: dict) -> dict:
 
 SCENES = [scene_server, scene_api, scene_stream, scene_sampling, scene_prefix,
           scene_multiturn, scene_concurrent, scene_cancel, scene_errors,
-          scene_internals]
+          scene_load, scene_internals]
 
 
 # ── server launch ────────────────────────────────────────────────────────────
