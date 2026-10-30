@@ -17,6 +17,7 @@ Then run, with no further input:
 
     python demo/qwen3/live_race.py                 # 3 questions one by one, then 16 at once
     python demo/qwen3/live_race.py "问题一" "问题二"  # your own questions instead of the 3
+    python demo/qwen3/live_race.py --only right    # one server only (one free GPU)
 
 Every request carries the whole handbook (``live_race_doc.md``) as its system
 prompt.  The prompt starts with a run number that changes on every run, so
@@ -51,6 +52,8 @@ except ImportError:  # pragma: no cover
 
 DOC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_race_doc.md")
 CUT = "<!-- short-cut -->"
+# One KV page of Qwen3-0.6B: 28 layers x (K, V) x 64 tokens x 8 heads x 128 dims x bf16.
+MB_PER_PAGE = 7
 
 # All answered in sections 1-13, so they work with the short handbook too.
 QUESTIONS = [
@@ -82,6 +85,8 @@ class Side:
     url: str
     style: str
     model: str = ""
+    kv_now: int | None = None
+    kv_peak: int | None = None
 
     def get(self, path, timeout=30.0):
         with urllib.request.urlopen(self.url + path, timeout=timeout) as r:
@@ -97,6 +102,25 @@ class Side:
             return int(rep["gpu"]["gpu_stats"].get("match_pages", 0))
         return int((rep.get("cpu") or {}).get("cache_blocks_matched", 0))
 
+    def pages_in_use(self):
+        """KV pages held right now: by running requests and, with a cache, by
+        the cache for later requests."""
+        try:
+            pages = self.get("/debug/prefix_cache?settle=0", timeout=5)["pages"]
+        except Exception:
+            return None
+        return pages["total"] - pages["gpu_free"] - pages["pending_returns"]
+
+
+def watch_kv(side: Side, stop: threading.Event):
+    side.kv_now = side.kv_peak = None
+    while not stop.is_set():
+        used = side.pages_in_use()
+        if used is not None:
+            side.kv_now = used
+            side.kv_peak = max(side.kv_peak or 0, used)
+        stop.wait(0.05)
+
 
 @dataclass
 class Run:
@@ -106,6 +130,7 @@ class Run:
     t_end: float | None = None
     text: str = ""
     error: str | None = None
+    tokens: int = 0  # prompt + completion, as the server counts them
 
     @property
     def ttft(self):
@@ -128,6 +153,7 @@ def visible(text):
 def stream(side: Side, run: Run, system: str, max_tokens: int, start: threading.Event):
     body = json.dumps({
         "model": side.model, "stream": True, "temperature": 0, "max_tokens": max_tokens,
+        "stream_options": {"include_usage": True},
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": run.question + " /no_think"}],
     })
@@ -145,7 +171,10 @@ def stream(side: Side, run: Run, system: str, max_tokens: int, start: threading.
             line = line.decode("utf-8", "replace").strip()
             if not line.startswith("data:") or line == "data: [DONE]":
                 continue
-            for choice in json.loads(line[5:]).get("choices", []):
+            event = json.loads(line[5:])
+            if event.get("usage"):
+                run.tokens = event["usage"].get("total_tokens", 0)
+            for choice in event.get("choices", []):
                 piece = (choice.get("delta") or {}).get("content") or ""
                 if piece:
                     if run.t_first is None:
@@ -162,21 +191,29 @@ def fmt_s(seconds):
     return f"{seconds * 1000:.0f} ms" if seconds < 1 else f"{seconds:.2f} s"
 
 
-def side_by_side(left, right):
+def fmt_kv(pages):
+    mb = pages * MB_PER_PAGE
+    return f"{mb:.0f} MB" if mb < 1000 else f"{mb / 1024:.1f} GB"
+
+
+def side_by_side(*panels):
     grid = Table.grid(expand=True, padding=(0, 1))
-    grid.add_column(ratio=1)
-    grid.add_column(ratio=1)
-    grid.add_row(left, right)
+    for _ in panels:
+        grid.add_column(ratio=1)
+    grid.add_row(*panels)
     return grid
 
 
-def race(console, sides, questions, system, max_tokens, render):
-    """Send *questions* to both sides at once, redrawing with *render*."""
+def race(console, sides, questions, system, max_tokens, render, kv=False):
+    """Send *questions* to both sides at once, redrawing with *render*; with
+    *kv*, also follow each side's KV page use."""
     runs = [[Run(q) for q in questions] for _ in sides]
-    start = threading.Event()
+    start, stop = threading.Event(), threading.Event()
     threads = [threading.Thread(target=stream, args=(s, r, system, max_tokens, start), daemon=True)
                for s, rs in zip(sides, runs) for r in rs]
-    for t in threads:
+    watchers = [threading.Thread(target=watch_kv, args=(s, stop), daemon=True)
+                for s in sides if kv]
+    for t in watchers + threads:
         t.start()
     t0 = time.perf_counter()
     for r in (r for rs in runs for r in rs):
@@ -187,6 +224,9 @@ def race(console, sides, questions, system, max_tokens, render):
             live.update(render(sides, runs, time.perf_counter()))
             time.sleep(1 / 15)
         live.update(render(sides, runs, time.perf_counter()))
+    stop.set()
+    for t in watchers:
+        t.join()
     return runs
 
 
@@ -210,9 +250,11 @@ def render_many(sides, runs, now):
     for side, rs in zip(sides, runs):
         done = sum(r.t_end is not None for r in rs)
         end = max(r.t_end for r in rs) if done == len(rs) else now
-        line = Text(f"已完成 {done}/{len(rs)}   用时 {end - rs[0].t0:.1f} s",
-                    style=f"bold {side.style}" if done == len(rs) else "")
-        panels.append(Panel(line, title=side.label, border_style=side.style))
+        lines = [Text(f"已完成 {done}/{len(rs)}   用时 {end - rs[0].t0:.1f} s",
+                      style=f"bold {side.style}" if done == len(rs) else "")]
+        if side.kv_now is not None:
+            lines.append(Text(f"KV 显存 正在用 {fmt_kv(side.kv_now)}   峰值 {fmt_kv(side.kv_peak)}"))
+        panels.append(Panel(Group(*lines), title=side.label, border_style=side.style))
     return side_by_side(*panels)
 
 
@@ -225,11 +267,15 @@ def main():
                    help="long (~2750 tokens) for --max-seq-length 4096, short (~1900) for 2048")
     p.add_argument("--n", type=int, default=16, help="questions sent at once at the end (0: skip)")
     p.add_argument("--max-tokens", type=int, default=80)
+    p.add_argument("--only", choices=["left", "right"],
+                   help="run the same flow against one server (when only one GPU is free)")
     args = p.parse_args()
 
     console = Console()
-    sides = [Side("不开 prefix cache", args.left.rstrip("/"), "yellow"),
-             Side("GPU prefix cache", args.right.rstrip("/"), "cyan")]
+    left = Side("不开 prefix cache", args.left.rstrip("/"), "yellow")
+    right = Side("GPU prefix cache", args.right.rstrip("/"), "cyan")
+    sides = {"left": [left], "right": [right]}.get(args.only, [left, right])
+    cached = right if right in sides else None
     for s in sides:
         try:
             s.model = s.get("/v1/models", timeout=5)["data"][0]["id"]
@@ -244,20 +290,33 @@ def main():
 
     for i, q in enumerate(args.questions or QUESTIONS[:3], 1):
         console.print(f"\n[bold]问题 {i}：{q}")
-        before = sides[1].pages_hit()
-        (a,), (b,) = race(console, sides, [q], system, args.max_tokens, render_one)
-        hit = sides[1].pages_hit() - before
-        if a.ttft is not None and b.ttft is not None:
-            console.print(f"首字 {fmt_s(a.ttft)} vs {fmt_s(b.ttft)}"
-                          f"（右边从 cache 复用了 {hit} 页，{hit * 64} 个 token）", style="dim")
+        before = cached.pages_hit() if cached else 0
+        firsts = [rs[0] for rs in race(console, sides, [q], system, args.max_tokens, render_one)]
+        if all(r.ttft is not None for r in firsts):
+            note = ""
+            if cached:
+                hit = cached.pages_hit() - before
+                note = f"（{cached.label} 从 cache 复用了 {hit} 页 KV，{fmt_kv(hit)}）"
+            console.print("首字 " + " vs ".join(fmt_s(r.ttft) for r in firsts) + note, style="dim")
         time.sleep(1)
 
     if args.n:
         qs = [QUESTIONS[(3 + i) % len(QUESTIONS)] for i in range(args.n)]
-        console.print(f"\n[bold]{args.n} 个问题同时发给两边")
-        a, b = race(console, sides, qs, system, args.max_tokens, render_many)
-        wall = [max(r.t_end for r in rs) - rs[0].t0 for rs in (a, b)]
-        console.print(f"全部答完 {wall[0]:.1f} s vs {wall[1]:.1f} s", style="dim")
+        console.print(f"\n[bold]{args.n} 个问题同时发出")
+        before = cached.pages_hit() if cached else 0
+        runs = race(console, sides, qs, system, args.max_tokens, render_many, kv=True)
+        hit = cached.pages_hit() - before if cached else 0
+        console.print("全部答完 " + " vs ".join(
+            f"{max(r.t_end for r in rs) - rs[0].t0:.1f} s" for rs in runs), style="dim")
+        # KV the side had to compute: every prompt and answer token, minus
+        # what the cache handed over ready-made.
+        fresh = [sum(r.tokens for r in rs) / 64 - (hit if s is cached else 0)
+                 for s, rs in zip(sides, runs)]
+        note = f"（{cached.label} 从 cache 复用了 {fmt_kv(hit)}）" if cached else ""
+        if all(r.tokens for rs in runs for r in rs):
+            console.print("新算的 KV " + " vs ".join(fmt_kv(f) for f in fresh) + note, style="dim")
+        if all(s.kv_peak is not None for s in sides):
+            console.print("KV 显存峰值 " + " vs ".join(fmt_kv(s.kv_peak) for s in sides), style="dim")
     return 0
 
 
