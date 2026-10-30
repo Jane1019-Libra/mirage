@@ -1,8 +1,8 @@
-"""Side-by-side race: the same questions go to two servers at the same moment
--- one without a prefix cache, one with the GPU prefix cache -- and both
-answers stream next to each other.
+"""Side-by-side race: the same questions go at the same moment to servers that
+differ only in their prefix cache -- none, the CPU prefix cache, the GPU
+prefix cache -- and their answers stream next to each other.
 
-Start the two servers first, each on its own idle GPU (a persistent kernel must
+Start the servers first, each on its own idle GPU (a persistent kernel must
 not share its GPU), identical except for the cache flag:
 
     CUDA_VISIBLE_DEVICES=0 python -m mirage.engine.launch_server \\
@@ -12,17 +12,22 @@ not share its GPU), identical except for the cache flag:
         --model Qwen/Qwen3-0.6B --max-num-batched-requests 4 --max-num-batched-tokens 8 \\
         --page-size 64 --max-seq-length 4096 --max-num-pages 512 --port 8002 \\
         --gpu-prefix-cache
+    CUDA_VISIBLE_DEVICES=2 python -m mirage.engine.launch_server \\
+        --model Qwen/Qwen3-0.6B --max-num-batched-requests 4 --max-num-batched-tokens 8 \\
+        --page-size 64 --max-seq-length 4096 --max-num-pages 512 --port 8003 \\
+        --enable-prefix-cache
 
-Then run, with no further input:
+Then run, with no further input (servers that are not up are left out):
 
     python demo/qwen3/live_race.py                 # 3 questions one by one, then 16 at once
     python demo/qwen3/live_race.py "Q1?" "Q2?"      # your own questions instead of the 3
-    python demo/qwen3/live_race.py --only right    # one server only (one free GPU)
+    python demo/qwen3/live_race.py --only cpu      # one server only (one free GPU)
+    python demo/qwen3/live_race.py --cold-burst    # the 16 arrive before anything is cached
 
 Every request carries the whole handbook (``live_race_doc.md``) as its system
 prompt.  The prompt starts with a run number that changes on every run, so
-the first question of a run is cold on both sides; from the second one on,
-the cached side reuses the handbook.  Servers started with
+the first question of a run is cold on every side; from the second one on,
+the cached sides reuse the handbook.  Servers started with
 ``--max-seq-length 2048`` need ``--doc short``.
 """
 
@@ -54,6 +59,10 @@ DOC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_race_d
 CUT = "<!-- short-cut -->"
 # One KV page of Qwen3-0.6B: 28 layers x (K, V) x 64 tokens x 8 heads x 128 dims x bf16.
 MB_PER_PAGE = 7
+# Column title and colour for each cache mode a server reports.
+MODES = {"off": ("No prefix cache", "yellow"),
+         "cpu": ("CPU prefix cache", "magenta"),
+         "gpu": ("GPU prefix cache", "cyan")}
 
 # All answered in sections 1-13, so they work with the short handbook too.
 QUESTIONS = [
@@ -91,6 +100,12 @@ class Side:
     def get(self, path, timeout=30.0):
         with urllib.request.urlopen(self.url + path, timeout=timeout) as r:
             return json.loads(r.read())
+
+    def cache_mode(self):
+        rep = self.get("/debug/prefix_cache?settle=0", timeout=10)
+        if rep.get("gpu_mode") == "owner":
+            return "gpu"
+        return "cpu" if (rep.get("cpu") or {}).get("cache_enabled") else "off"
 
     def pages_hit(self):
         """Prefix pages served from the cache so far (any cache mode)."""
@@ -241,7 +256,7 @@ def render_one(sides, runs, now):
             head = Text(f"first token {fmt_s(run.ttft)}", style=f"bold {side.style}")
         foot = Text("" if run.t_end is None else f"done {fmt_s(run.total)}", style="dim")
         panels.append(Panel(Group(head, Text(""), Text(visible(run.text)), Text(""), foot),
-                            title=side.label, border_style=side.style, height=9))
+                            title=side.label, border_style=side.style, height=10))
     return side_by_side(*panels)
 
 
@@ -263,57 +278,77 @@ def main():
     p.add_argument("questions", nargs="*", help="asked one by one (default: three built-in ones)")
     p.add_argument("--left", default="http://127.0.0.1:8001", help="server without a prefix cache")
     p.add_argument("--right", default="http://127.0.0.1:8002", help="server with --gpu-prefix-cache")
+    p.add_argument("--cpu", default="http://127.0.0.1:8003", help="server with --enable-prefix-cache")
     p.add_argument("--doc", choices=["long", "short"], default="long",
                    help="long (~2600 tokens) for --max-seq-length 4096, short (~1750) for 2048")
     p.add_argument("--n", type=int, default=16, help="questions sent at once at the end (0: skip)")
     p.add_argument("--max-tokens", type=int, default=80)
-    p.add_argument("--only", choices=["left", "right"],
-                   help="run the same flow against one server (when only one GPU is free)")
+    p.add_argument("--cold-burst", action="store_true",
+                   help="send the batch with a new run number, before the handbook is cached")
+    p.add_argument("--only", nargs="+", choices=["left", "cpu", "right"],
+                   help="race only these servers (default: every one that is up)")
     args = p.parse_args()
 
     console = Console()
-    left = Side("No prefix cache", args.left.rstrip("/"), "yellow")
-    right = Side("GPU prefix cache", args.right.rstrip("/"), "cyan")
-    sides = {"left": [left], "right": [right]}.get(args.only, [left, right])
-    cached = right if right in sides else None
-    for s in sides:
+    sides = []
+    for name, url in (("left", args.left), ("cpu", args.cpu), ("right", args.right)):
+        if args.only and name not in args.only:
+            continue
+        side = Side("", url.rstrip("/"), "")
         try:
-            s.model = s.get("/v1/models", timeout=5)["data"][0]["id"]
+            side.model = side.get("/v1/models", timeout=5)["data"][0]["id"]
+            # Titled by what the server says it runs, not by its port.
+            side.label, side.style = MODES[side.cache_mode()]
         except Exception as exc:
-            sys.exit(f"{s.label}: cannot reach {s.url}: {exc}")
+            if args.only:
+                sys.exit(f"cannot reach {side.url}: {exc}")
+            continue
+        sides.append(side)
+    if not sides:
+        sys.exit("No server is up yet; start them first (see the top of this file).")
+    console.print("Racing: " + " | ".join(f"[{s.style}]{s.label}[/] ({s.url})" for s in sides))
+    cached = [s for s in sides if s.label != MODES["off"][0]]
 
     doc = open(DOC_PATH, encoding="utf-8").read()
     doc = doc.split(CUT)[0].rstrip() if args.doc == "short" else doc.replace(CUT + "\n\n", "")
-    # The run number comes first, so nothing cached by an earlier run can match.
-    system = (f"Demo run {random.randint(1000, 9999)}. You are the customer service assistant "
-              f"of Xinghe City Metro. Answer the passenger's question using only the handbook "
-              f"below, in at most two sentences.\n\n{doc}")
+
+    def system_prompt():
+        # The run number comes first, so nothing cached under another number can match.
+        return (f"Demo run {random.randint(1000, 9999)}. You are the customer service assistant "
+                f"of Xinghe City Metro. Answer the passenger's question using only the handbook "
+                f"below, in at most two sentences.\n\n{doc}")
+
+    system = system_prompt()
 
     for i, q in enumerate(args.questions or QUESTIONS[:3], 1):
         console.print(f"\n[bold]Question {i}: {q}")
-        before = cached.pages_hit() if cached else 0
+        before = [s.pages_hit() for s in cached]
         firsts = [rs[0] for rs in race(console, sides, [q], system, args.max_tokens, render_one)]
         if all(r.ttft is not None for r in firsts):
-            note = ""
-            if cached:
-                hit = cached.pages_hit() - before
-                note = f"  ({cached.label} reused {hit} KV pages, {fmt_kv(hit)}, from its cache)"
+            hits = [s.pages_hit() - b for s, b in zip(cached, before)]
+            note = "  (reused from cache: " + ", ".join(
+                f"{s.label} {h} pages = {fmt_kv(h)}" for s, h in zip(cached, hits)) + ")"
+            note = note if cached else ""
             console.print("first token " + " vs ".join(fmt_s(r.ttft) for r in firsts) + note, style="dim")
         time.sleep(1)
 
     if args.n:
         qs = [QUESTIONS[(3 + i) % len(QUESTIONS)] for i in range(args.n)]
-        console.print(f"\n[bold]{args.n} questions at once")
-        before = cached.pages_hit() if cached else 0
+        if args.cold_burst:
+            system = system_prompt()
+        console.print(f"\n[bold]{args.n} questions at once"
+                      + (", handbook not cached yet" if args.cold_burst else ""))
+        before = [s.pages_hit() for s in cached]
         runs = race(console, sides, qs, system, args.max_tokens, render_many, kv=True)
-        hit = cached.pages_hit() - before if cached else 0
+        hits = {s.url: s.pages_hit() - b for s, b in zip(cached, before)}
         console.print("all answered in " + " vs ".join(
             f"{max(r.t_end for r in rs) - rs[0].t0:.1f} s" for rs in runs), style="dim")
         # KV the side had to compute: every prompt and answer token, minus
         # what the cache handed over ready-made.
-        fresh = [sum(r.tokens for r in rs) / 64 - (hit if s is cached else 0)
+        fresh = [sum(r.tokens for r in rs) / 64 - hits.get(s.url, 0)
                  for s, rs in zip(sides, runs)]
-        note = f"  ({cached.label} took {fmt_kv(hit)} from its cache)" if cached else ""
+        note = "  (taken from cache: " + ", ".join(
+            f"{s.label} {fmt_kv(hits[s.url])}" for s in cached) + ")" if cached else ""
         if all(r.tokens for rs in runs for r in rs):
             console.print("KV computed " + " vs ".join(fmt_kv(f) for f in fresh) + note, style="dim")
         if all(s.kv_peak is not None for s in sides):
