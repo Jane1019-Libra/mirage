@@ -16,7 +16,7 @@ not share its GPU), identical except for the cache flag:
 Then run, with no further input:
 
     python demo/qwen3/live_race.py                 # 3 questions one by one, then 16 at once
-    python demo/qwen3/live_race.py "问题一" "问题二"  # your own questions instead of the 3
+    python demo/qwen3/live_race.py "Q1?" "Q2?"      # your own questions instead of the 3
     python demo/qwen3/live_race.py --only right    # one server only (one free GPU)
 
 Every request carries the whole handbook (``live_race_doc.md``) as its system
@@ -57,25 +57,25 @@ MB_PER_PAGE = 7
 
 # All answered in sections 1-13, so they work with the short handbook too.
 QUESTIONS = [
-    "机场站进出站要另外加收多少钱？",          # 5 元
-    "失物一般保管多少天？",                    # 30 天
-    "除夕当天末班车几点？",                    # 21:00
-    "6 号线是哪一天开通的？",                  # 2025 年 12 月 28 日
-    "最长的换乘通道在哪个站？有多长？",        # 星河大道站，420 米
-    "1 号线丢了东西应该去哪里领？",            # 人民广场站 B1 层
-    "普通自行车什么时候可以带上地铁？",        # 周末 9:00-16:00，3 号线最后一节车厢
-    "可以带多大的充电宝？",                    # 不超过 100 瓦时
-    "多少积分可以抵扣 1 元车费？",             # 100 个
-    "单件行李最重可以多少公斤？",              # 20 公斤
-    "老年人多少岁以上可以免费乘车？",          # 65 岁
-    "一名成人最多可以带几名免费儿童？",        # 2 名
-    "星河通卡打几折？",                        # 9.5 折
-    "单程票最高多少钱？",                      # 12 元
-    "4 号线快线区段最高时速是多少？",          # 120 公里
-    "高峰期 1 号线的发车间隔是多少？",         # 2 分 30 秒
-    "无障碍服务要提前多久预约？",              # 2 小时
-    "投诉多久会得到答复？",                    # 3 个工作日内
-    "免费 Wi-Fi 的网络名称是什么？",           # XingheMetro
+    "How much extra does it cost to enter or exit at Airport station?",  # 5 yuan
+    "How long are lost items kept?",                                     # 30 days
+    "When is the last train on Chinese New Year's Eve?",                 # 21:00
+    "When did Line 6 open?",                                             # December 28, 2025
+    "Which station has the longest transfer, and how long is it?",       # Xinghe Avenue, 420 m
+    "Where do I collect something I lost on Line 1?",                    # People's Square, level B1
+    "When can I bring a regular bicycle on the metro?",                  # weekends 9:00-16:00, Line 3, last car
+    "How large a power bank may I bring?",                               # up to 100 Wh
+    "How many points do I need for 1 yuan off a fare?",                  # 100
+    "What is the maximum weight of one piece of luggage?",               # 20 kg
+    "From what age do seniors ride for free?",                           # 65
+    "How many free children can one adult bring?",                       # 2
+    "What discount does the Xinghe Pass give?",                          # 5% off
+    "What is the highest single-trip fare?",                             # 12 yuan
+    "What is the top speed on the Line 4 express section?",              # 120 km/h
+    "How often do Line 1 trains run at peak hours?",                     # every 2 min 30 s
+    "How far ahead must I book accessibility assistance?",               # 2 hours
+    "How soon will I get a reply to a complaint?",                       # within 3 working days
+    "What is the name of the free Wi-Fi network?",                       # XingheMetro
 ]
 
 
@@ -236,10 +236,10 @@ def render_one(sides, runs, now):
         if run.error:
             head = Text(run.error, style="bold red")
         elif run.t_first is None:
-            head = Text(f"等待中 {fmt_s(now - run.t0)}", style="dim")
+            head = Text(f"waiting {fmt_s(now - run.t0)}", style="dim")
         else:
-            head = Text(f"首字 {fmt_s(run.ttft)}", style=f"bold {side.style}")
-        foot = Text("" if run.t_end is None else f"完成 {fmt_s(run.total)}", style="dim")
+            head = Text(f"first token {fmt_s(run.ttft)}", style=f"bold {side.style}")
+        foot = Text("" if run.t_end is None else f"done {fmt_s(run.total)}", style="dim")
         panels.append(Panel(Group(head, Text(""), Text(visible(run.text)), Text(""), foot),
                             title=side.label, border_style=side.style, height=9))
     return side_by_side(*panels)
@@ -250,10 +250,10 @@ def render_many(sides, runs, now):
     for side, rs in zip(sides, runs):
         done = sum(r.t_end is not None for r in rs)
         end = max(r.t_end for r in rs) if done == len(rs) else now
-        lines = [Text(f"已完成 {done}/{len(rs)}   用时 {end - rs[0].t0:.1f} s",
+        lines = [Text(f"answered {done}/{len(rs)}   elapsed {end - rs[0].t0:.1f} s",
                       style=f"bold {side.style}" if done == len(rs) else "")]
         if side.kv_now is not None:
-            lines.append(Text(f"KV 显存 正在用 {fmt_kv(side.kv_now)}   峰值 {fmt_kv(side.kv_peak)}"))
+            lines.append(Text(f"KV memory in use {fmt_kv(side.kv_now)}   peak {fmt_kv(side.kv_peak)}"))
         panels.append(Panel(Group(*lines), title=side.label, border_style=side.style))
     return side_by_side(*panels)
 
@@ -264,7 +264,7 @@ def main():
     p.add_argument("--left", default="http://127.0.0.1:8001", help="server without a prefix cache")
     p.add_argument("--right", default="http://127.0.0.1:8002", help="server with --gpu-prefix-cache")
     p.add_argument("--doc", choices=["long", "short"], default="long",
-                   help="long (~2750 tokens) for --max-seq-length 4096, short (~1900) for 2048")
+                   help="long (~2600 tokens) for --max-seq-length 4096, short (~1750) for 2048")
     p.add_argument("--n", type=int, default=16, help="questions sent at once at the end (0: skip)")
     p.add_argument("--max-tokens", type=int, default=80)
     p.add_argument("--only", choices=["left", "right"],
@@ -272,7 +272,7 @@ def main():
     args = p.parse_args()
 
     console = Console()
-    left = Side("不开 prefix cache", args.left.rstrip("/"), "yellow")
+    left = Side("No prefix cache", args.left.rstrip("/"), "yellow")
     right = Side("GPU prefix cache", args.right.rstrip("/"), "cyan")
     sides = {"left": [left], "right": [right]}.get(args.only, [left, right])
     cached = right if right in sides else None
@@ -280,43 +280,44 @@ def main():
         try:
             s.model = s.get("/v1/models", timeout=5)["data"][0]["id"]
         except Exception as exc:
-            sys.exit(f"{s.label} {s.url} 连不上：{exc}")
+            sys.exit(f"{s.label}: cannot reach {s.url}: {exc}")
 
     doc = open(DOC_PATH, encoding="utf-8").read()
     doc = doc.split(CUT)[0].rstrip() if args.doc == "short" else doc.replace(CUT + "\n\n", "")
     # The run number comes first, so nothing cached by an earlier run can match.
-    system = (f"演示编号 {random.randint(1000, 9999)}。你是星河市地铁的客服助手。"
-              f"请只根据下面的手册回答乘客的问题，回答不超过两句话。\n\n{doc}")
+    system = (f"Demo run {random.randint(1000, 9999)}. You are the customer service assistant "
+              f"of Xinghe City Metro. Answer the passenger's question using only the handbook "
+              f"below, in at most two sentences.\n\n{doc}")
 
     for i, q in enumerate(args.questions or QUESTIONS[:3], 1):
-        console.print(f"\n[bold]问题 {i}：{q}")
+        console.print(f"\n[bold]Question {i}: {q}")
         before = cached.pages_hit() if cached else 0
         firsts = [rs[0] for rs in race(console, sides, [q], system, args.max_tokens, render_one)]
         if all(r.ttft is not None for r in firsts):
             note = ""
             if cached:
                 hit = cached.pages_hit() - before
-                note = f"（{cached.label} 从 cache 复用了 {hit} 页 KV，{fmt_kv(hit)}）"
-            console.print("首字 " + " vs ".join(fmt_s(r.ttft) for r in firsts) + note, style="dim")
+                note = f"  ({cached.label} reused {hit} KV pages, {fmt_kv(hit)}, from its cache)"
+            console.print("first token " + " vs ".join(fmt_s(r.ttft) for r in firsts) + note, style="dim")
         time.sleep(1)
 
     if args.n:
         qs = [QUESTIONS[(3 + i) % len(QUESTIONS)] for i in range(args.n)]
-        console.print(f"\n[bold]{args.n} 个问题同时发出")
+        console.print(f"\n[bold]{args.n} questions at once")
         before = cached.pages_hit() if cached else 0
         runs = race(console, sides, qs, system, args.max_tokens, render_many, kv=True)
         hit = cached.pages_hit() - before if cached else 0
-        console.print("全部答完 " + " vs ".join(
+        console.print("all answered in " + " vs ".join(
             f"{max(r.t_end for r in rs) - rs[0].t0:.1f} s" for rs in runs), style="dim")
         # KV the side had to compute: every prompt and answer token, minus
         # what the cache handed over ready-made.
         fresh = [sum(r.tokens for r in rs) / 64 - (hit if s is cached else 0)
                  for s, rs in zip(sides, runs)]
-        note = f"（{cached.label} 从 cache 复用了 {fmt_kv(hit)}）" if cached else ""
+        note = f"  ({cached.label} took {fmt_kv(hit)} from its cache)" if cached else ""
         if all(r.tokens for rs in runs for r in rs):
-            console.print("新算的 KV " + " vs ".join(fmt_kv(f) for f in fresh) + note, style="dim")
+            console.print("KV computed " + " vs ".join(fmt_kv(f) for f in fresh) + note, style="dim")
         if all(s.kv_peak is not None for s in sides):
-            console.print("KV 显存峰值 " + " vs ".join(fmt_kv(s.kv_peak) for s in sides), style="dim")
+            console.print("peak KV memory " + " vs ".join(fmt_kv(s.kv_peak) for s in sides), style="dim")
     return 0
 
 

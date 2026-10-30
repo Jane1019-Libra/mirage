@@ -1,83 +1,83 @@
-# 星河市地铁乘客服务手册（2026 版）
+# Xinghe City Metro Passenger Handbook (2026 Edition)
 
-## 一、线路概况
+## 1. Network Overview
 
-星河市地铁目前运营 6 条线路，总里程 214 公里，共 158 座车站，其中换乘站 22 座。1 号线为红色，从西山站到东湖站，全长 38 公里，共 29 站，是全市最早开通的线路，于 1998 年 10 月 1 日通车。2 号线为蓝色，是一条环线，全长 41 公里，共 31 站，列车跑完一整圈大约需要 78 分钟。3 号线为绿色，从北站到南港站，全长 35 公里，共 24 站。4 号线为橙色，从机场站到会展中心站，全长 27 公里，共 15 站，其中机场站到星河大道站是快线区段，列车最高时速 120 公里，中途不停站。5 号线为紫色，从科学城站到老城门站，全长 33 公里，共 27 站。6 号线为黄色，从云杉湾站到铁路东站，全长 40 公里，共 32 站，于 2025 年 12 月 28 日开通，是最新的一条线路。
+Xinghe City Metro operates 6 lines with a total length of 214 km and 158 stations, 22 of which are transfer stations. Line 1 (red) runs from West Hills to East Lake. It is 38 km long with 29 stations and is the oldest line in the city, opened on October 1, 1998. Line 2 (blue) is a loop line, 41 km long with 31 stations; a train takes about 78 minutes to complete one full loop. Line 3 (green) runs from North Station to South Harbor, 35 km with 24 stations. Line 4 (orange) runs from Airport to Expo Center, 27 km with 15 stations; the section from Airport to Xinghe Avenue is an express section where trains reach 120 km/h and make no intermediate stops. Line 5 (purple) runs from Science City to Old City Gate, 33 km with 27 stations. Line 6 (yellow) runs from Spruce Bay to East Railway Station, 40 km with 32 stations. It opened on December 28, 2025 and is the newest line.
 
-## 二、运营时间与发车间隔
+## 2. Operating Hours and Train Frequency
 
-各线路首班车一般在早上 5:30 从起点站发出，末班车一般在晚上 23:00 从起点站发出。4 号线机场站首班车提前到 5:00，末班车延后到 0:00，以便衔接早晚航班。每逢周五和周六，1 号线、2 号线和 4 号线的末班车延长到次日 0:30。早高峰为 7:00 至 9:30，晚高峰为 17:00 至 19:30。高峰期间 1 号线和 2 号线的发车间隔为 2 分 30 秒，其余线路为 4 分钟；平峰时段各线路发车间隔为 5 分钟；22:00 以后发车间隔为 8 分钟。遇到大型活动散场时，地铁会临时加开列车，具体安排以车站广播为准。
+On most lines the first train leaves the terminal at 5:30 and the last train at 23:00. On Line 4 the first train from Airport leaves at 5:00 and the last at 0:00, to serve early and late flights. Every Friday and Saturday, the last trains on Lines 1, 2 and 4 run until 0:30 the next day. The morning peak is 7:00 to 9:30 and the evening peak is 17:00 to 19:30. During peak hours, trains on Lines 1 and 2 run every 2 minutes 30 seconds and on the other lines every 4 minutes; off-peak, all lines run every 5 minutes; after 22:00, every 8 minutes. When large events end, extra trains may be added; follow station announcements for details.
 
-## 三、票价与支付
+## 3. Fares and Payment
 
-星河市地铁按里程计价。起步价为 3 元，可乘坐 6 公里以内；6 至 16 公里之间每 5 公里加 1 元；16 至 30 公里之间每 7 公里加 1 元；30 公里以上每 10 公里加 1 元；单程票价最高 12 元。从机场站进站或出站，需要另外加收 5 元机场附加费。乘客可以使用星河通卡、手机扫码、银联闪付或单程票乘车。使用星河通卡乘车享受 9.5 折优惠；同一自然月内，从第 41 次乘车开始享受 8 折优惠。学生持学生卡乘车享受 5 折优惠。65 岁以上的老年人凭身份证免费乘车。身高 1.3 米以下的儿童免费乘车，但每名成人最多带 2 名免费儿童。
+Fares are distance-based. The base fare is 3 yuan for up to 6 km; from 6 to 16 km, 1 yuan is added for every 5 km; from 16 to 30 km, 1 yuan for every 7 km; beyond 30 km, 1 yuan for every 10 km. The maximum single-trip fare is 12 yuan. Entering or exiting at Airport station costs an additional 5 yuan airport surcharge. Passengers can pay with the Xinghe Pass card, a mobile QR code, contactless bank cards, or a single-journey ticket. Rides paid with the Xinghe Pass get 5% off; within the same calendar month, rides from the 41st onward get 20% off. Students with a student card get 50% off. Seniors aged 65 and over ride free with their ID card. Children under 1.3 m ride free, but each adult may bring at most 2 free children.
 
-## 四、换乘
+## 4. Transfers
 
-全线网共有 22 座换乘站，站内换乘无需重新刷卡。换乘距离最长的是星河大道站，1 号线与 4 号线之间的换乘通道长 420 米，步行约需 6 分钟，通道内设有自动步道。如果乘客在同一座车站出站后 30 分钟内重新进站，系统会按一次连续行程计费，这项规定只在人民广场站、北站和会展中心站三座出站换乘站适用。
+There are 22 transfer stations, and transferring inside a station needs no extra tap. The longest transfer is at Xinghe Avenue: the passage between Line 1 and Line 4 is 420 m long, about a 6-minute walk, with moving walkways. If a passenger exits and re-enters the same station within 30 minutes, the system charges one continuous trip; this rule applies only at the three out-of-station transfer stations: People's Square, North Station and Expo Center.
 
-## 五、行李规定
+## 5. Luggage
 
-乘客携带的单件行李重量不得超过 20 公斤，长、宽、高之和不得超过 1.6 米，长度不得超过 1.8 米。4 号线机场快线允许携带 28 寸及以下的行李箱，车厢内设有行李架。超过规定的大件行李请选择出租车或机场大巴。行李安检时，请将笔记本电脑和平板电脑留在包内，不需要单独取出。
+A single piece of luggage may weigh at most 20 kg, its length, width and height may add up to at most 1.6 m, and its length may not exceed 1.8 m. The Line 4 airport express allows suitcases of 28 inches or smaller and has luggage racks in every car. For oversized luggage, please take a taxi or the airport bus. At security checks, laptops and tablets can stay in your bag.
 
-## 六、自行车与宠物
+## 6. Bicycles and Pets
 
-折叠自行车折叠后可以带上地铁，任何时段都可以。普通自行车只能在周末 9:00 至 16:00 之间带上 3 号线，并且只能放在列车的最后一节车厢。乘客不得携带宠物乘车，但导盲犬除外；体积不超过 50 厘米乘 40 厘米乘 40 厘米、并装在封闭笼子里的小型宠物也可以带上车。
+Folding bicycles may be brought on board at any time once folded. Regular bicycles are allowed only on Line 3, on weekends between 9:00 and 16:00, and only in the last car. Pets are not allowed, except guide dogs; small pets in a closed cage no larger than 50 cm by 40 cm by 40 cm are also allowed.
 
-## 七、失物招领
+## 7. Lost and Found
 
-车站拾获的物品会在当天送到所在线路的失物招领中心。1 号线和 2 号线的失物招领中心在人民广场站 B1 层；3 号线和 5 号线在北站；4 号线在会展中心站；6 号线在云杉湾站。失物一般保管 30 天，价值 2000 元以上的贵重物品会移交公安部门。乘客可以拨打客服热线 96123 后按 3 查询失物，领取时需要出示身份证。
+Items found in stations are sent to the lost and found center of their line on the same day. The center for Lines 1 and 2 is on level B1 of People's Square station; for Lines 3 and 5 it is at North Station; for Line 4 at Expo Center; for Line 6 at Spruce Bay. Items are kept for 30 days, and valuables worth more than 2,000 yuan are handed over to the police. Call the hotline 96123 and press 3 to ask about a lost item, and bring your ID card to collect it.
 
-## 八、无障碍服务
+## 8. Accessibility
 
-每座车站至少设有 1 部无障碍电梯和 1 个无障碍卫生间。需要工作人员陪同或使用轮椅渡板的乘客，可以提前 2 小时拨打 96123 预约，工作人员会在进站口等候，并在换乘站和目的站安排接应。视障乘客可以在客服中心借用盲文线路图。
+Every station has at least one accessible elevator and one accessible toilet. Passengers who need staff assistance or a wheelchair ramp can book it by calling 96123 at least 2 hours in advance; staff will meet them at the entrance and arrange help at transfer and destination stations. Visually impaired passengers can borrow a braille line map at the customer service center.
 
-## 九、安全与禁止事项
+## 9. Safety and Prohibited Items
 
-禁止携带易燃、易爆、有毒等危险物品进站。乘客可以携带额定能量不超过 100 瓦时的充电宝。车厢内禁止饮食，饮用瓶装水除外。每节车厢两端都设有紧急对讲按钮，遇到紧急情况可以按下按钮与司机通话。站台候车时请站在黄色安全线以内，列车关门提示音响起后请不要再上下车。
+Flammable, explosive, toxic and other dangerous goods are prohibited. Power banks with a rated energy of up to 100 Wh are allowed. Eating and drinking are not allowed on trains, except bottled water. Each car has emergency intercom buttons at both ends for talking to the driver. While waiting, stand behind the yellow safety line, and do not board or leave the train once the door-closing chime sounds.
 
-## 十、投诉与建议
+## 10. Complaints and Suggestions
 
-乘客可以拨打客服热线 96123 反映问题，热线服务时间为每天 7:00 至 22:00。也可以在"星河地铁"手机应用的"意见反馈"页面提交投诉或建议。地铁公司承诺在 3 个工作日内答复，涉及赔偿的投诉在 10 个工作日内处理完毕。
+Passengers can call the hotline 96123, staffed daily from 7:00 to 22:00, or submit complaints and suggestions on the Feedback page of the Xinghe Metro app. The company promises a reply within 3 working days; complaints involving compensation are settled within 10 working days.
 
-## 十一、节假日运营安排
+## 11. Holiday Service
 
-春节除夕当天，各线路末班车提前到 21:00。元宵节当晚，1 号线和 2 号线末班车延长到次日 1:00。国庆节期间早高峰时段取消，全天按平峰时刻表运营。每年 12 月 31 日跨年夜，全线网通宵运营，0:00 以后的发车间隔为 15 分钟。
+On Chinese New Year's Eve, the last trains on all lines leave at 21:00. On the night of the Lantern Festival, the last trains on Lines 1 and 2 run until 1:00. During the National Day holiday the morning peak is cancelled and the off-peak timetable applies all day. On December 31 every year, the whole network runs all night, with trains every 15 minutes after midnight.
 
-## 十二、会员积分
+## 12. Loyalty Points
 
-使用星河通卡或手机扫码乘车，每消费 1 元可获得 1 个积分。每 100 个积分可以抵扣 1 元车费。积分自获得之日起 2 年内有效。会员每年生日当月乘车可以获得双倍积分。积分可以在"星河地铁"手机应用中查询，也可以在各站客服中心查询。
+Riding with the Xinghe Pass or a mobile QR code earns 1 point per yuan spent. Every 100 points can be redeemed for 1 yuan off a fare. Points are valid for 2 years from the day they are earned. Members earn double points during their birthday month. Points can be checked in the Xinghe Metro app or at any customer service center.
 
-## 十三、车站设施
+## 13. Station Facilities
 
-每座车站都设有卫生间，其中 32 座车站设有母婴室。全部车站和列车都提供免费 Wi-Fi，网络名称为 XingheMetro，连接后需要用手机号验证。车站客服中心提供充值、补票、发票打印和应急雨伞借用服务，雨伞需要在 7 天内归还到任意车站。
+Every station has toilets, and 32 stations have baby care rooms. All stations and trains offer free Wi-Fi with the network name XingheMetro; after connecting, verify with your phone number. Customer service centers offer top-ups, fare adjustments, invoice printing and emergency umbrella loans; umbrellas must be returned to any station within 7 days.
 
 <!-- short-cut -->
 
-## 十四、乘车礼仪
+## 14. Riding Etiquette
 
-上车时请先下后上，排队候车时请站在站台地面箭头的两侧。车厢内请将背包背在胸前或放在脚边，不要占用座位放置物品。使用电子设备时请佩戴耳机，不要外放声音。车厢内设有爱心专座，请主动让给老人、孕妇、残障人士和带小孩的乘客。乘坐自动扶梯时请靠右站立，左侧留给需要快速通行的乘客。
+Let passengers off before boarding, and wait on both sides of the arrows marked on the platform floor. On the train, wear your backpack on your front or put it at your feet, and do not use seats for your belongings. Use headphones with electronic devices and do not play sound out loud. Priority seats are for the elderly, pregnant women, people with disabilities and passengers with small children. On escalators, stand on the right and leave the left side for people walking.
 
-## 十五、儿童与学生乘车
+## 15. Children and Students
 
-身高 1.3 米以下的儿童需要在成人陪同下乘车。12 岁以下的儿童不得单独乘车。学生卡每年 9 月 1 日至 10 月 31 日集中办理，办理时需要提供学校开具的在读证明，学生卡在每年 8 月 31 日之后需要重新年审。学生卡每天最多享受 4 次 5 折优惠，超过 4 次后按普通票价计费。
+Children under 1.3 m must ride with an adult, and children under 12 may not ride alone. Student cards are issued each year from September 1 to October 31; applicants need a proof of enrollment from their school, and student cards must be renewed every year after August 31. A student card gets 50% off on at most 4 rides per day; further rides that day are charged the regular fare.
 
-## 十六、票务问题处理
+## 16. Ticket Problems
 
-如果单程票在出站时无法使用，请到客服中心由工作人员人工处理。如果乘客出站时卡内余额不足，需要在客服中心补足差额后出站。进站后超过 4 小时未出站的乘客，出站时需要补交一张单程最高票价，也就是 12 元。星河通卡遗失后可以凭身份证挂失，挂失后卡内余额在 7 个工作日后转入新卡，补办新卡收取工本费 20 元。电子发票可以在乘车后 30 天内在"星河地铁"手机应用中申请。
+If a single-journey ticket does not work at the exit gate, ask the staff at the customer service center. If your card balance is too low when exiting, top up the difference at the customer service center before leaving. Passengers who stay inside the system for more than 4 hours after entering must pay the maximum single fare, 12 yuan, when they exit. A lost Xinghe Pass can be reported with your ID card; the balance is moved to a new card after 7 working days, and the replacement card costs 20 yuan. Electronic invoices can be requested in the Xinghe Metro app within 30 days after the ride.
 
-## 十七、恶劣天气与突发情况
+## 17. Severe Weather and Emergencies
 
-遇到暴雨、台风等恶劣天气时，地面和高架区段可能限速运行，最高时速降到 60 公里。3 号线北站到南港站之间的高架区段在风力达到 8 级时会暂停运营，公司会安排接驳公交。列车因故障在区间停车时，请保持冷静，听从司机广播，不要自行打开车门或进入轨道。突发情况的最新信息会在"星河地铁"手机应用和车站显示屏上实时发布。
+In heavy rain, typhoons and other severe weather, surface and elevated sections may run at reduced speed, at most 60 km/h. The elevated section of Line 3 between North Station and South Harbor stops running when the wind reaches force 8, and shuttle buses are arranged. If a train stops between stations because of a fault, stay calm, follow the driver's announcements, and do not open the doors or enter the tracks. The latest information is posted in real time in the Xinghe Metro app and on station screens.
 
-## 十八、文明乘车与处罚
+## 18. Conduct and Penalties
 
-在车站或车厢内乞讨、卖艺、散发小广告、躺卧、踩踏座椅等行为都是被禁止的。不按规定购票、使用他人学生卡或老年卡的乘客，除补交票款外，还会被处以应补票款 5 倍的罚款。在车站内吸烟（包括电子烟）将被处以 200 元罚款。故意按动紧急按钮、阻挡车门影响列车运行的，由公安部门依法处理。
+Begging, busking, handing out flyers, lying down and standing on seats are prohibited in stations and on trains. Passengers who do not pay the correct fare, or who use someone else's student or senior card, must pay the fare plus a fine of 5 times the fare owed. Smoking in stations, including e-cigarettes, is fined 200 yuan. Deliberately pressing emergency buttons or blocking doors so that trains are delayed is handled by the police.
 
-## 十九、常见问题
+## 19. Frequently Asked Questions
 
-问：可以在车厢内给手机充电吗？答：每节车厢的座椅下方设有 USB 充电口，可以免费使用。问：地铁站能打印照片吗？答：人民广场站、北站和会展中心站的自助服务区设有自助打印机，可以打印照片和文件，每张 2 元。问：可以带鲜花上车吗？答：可以，但请注意不要影响其他乘客。问：在哪里可以买到纪念车票？答：纪念车票在 1 号线西山站和东湖站的客服中心发售，每套 50 元。
+Q: Can I charge my phone on the train? A: Every car has free USB charging ports under the seats. Q: Can I print photos at a station? A: Self-service printers at People's Square, North Station and Expo Center print photos and documents for 2 yuan per page. Q: Can I bring flowers? A: Yes, as long as they do not bother other passengers. Q: Where can I buy commemorative tickets? A: Commemorative tickets are sold at the customer service centers of West Hills and East Lake stations on Line 1, at 50 yuan per set.
 
-## 二十、联系方式
+## 20. Contact
 
-客服热线：96123，每天 7:00 至 22:00 人工服务。失物查询：96123 转 3。无障碍预约：96123 转 5。官方网站：www.xinghemetro.example。"星河地铁"手机应用可以在各大应用商店下载。地铁公司地址：星河市人民广场路 1 号，邮政编码 100088。
+Customer service hotline: 96123, staffed daily from 7:00 to 22:00. Lost and found: 96123, then press 3. Accessibility bookings: 96123, then press 5. Website: www.xinghemetro.example. The Xinghe Metro app is available in all major app stores. Company address: 1 People's Square Road, Xinghe City, postal code 100088.
